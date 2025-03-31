@@ -1,0 +1,4 @@
+python -m venv venv
+venv\Scripts\activate
+python install -r requirements.txt
+python app.py

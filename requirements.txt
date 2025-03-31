@@ -1,0 +1,9 @@
+requests
+matplotlib
+mplfinance
+plotly
+tkinterweb
+pandas
+PyQt6
+PyQt6-WebEngine
+schwab-py

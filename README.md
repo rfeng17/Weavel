@@ -1,0 +1,2 @@
+# TradingPlatform
+ PyQt trading platform
