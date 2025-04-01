@@ -1,5 +1,6 @@
 import logging
 import requests
+import yfinance as yf
 from flask_app.config import Config
 
 logger = logging.getLogger(__name__)
@@ -89,8 +90,8 @@ class MarketData:
             logger.error(f"Error fetching price history for {symbol}: {str(e)}")
             return None
 
-    def screen_stocks(self, symbols, min_price=0, max_price=float('inf'), min_volume=0, market_cap_filter="Any"):
-        """Screen stocks based on given criteria using Tradier quotes."""
+    def screen_stocks(self, symbols, min_price=0, max_price=1e9, min_volume=0, market_cap_filter="Any"):
+        """Screen stocks based on given criteria using Tradier quotes and yfinance for market cap."""
         try:
             symbols_str = ",".join(symbols)
             logger.debug(f"Fetching quotes for symbols: {symbols_str}")
@@ -108,11 +109,16 @@ class MarketData:
 
             stock_data = {}
             for quote in quotes:
-                symbol = quote["symbol"]
+                raw_symbol = quote["symbol"]
+                symbol = raw_symbol.split('.')[0].upper()
+                logger.debug(f"Raw symbol: {raw_symbol}, Normalized symbol: {symbol}")
+                market_cap = self._get_approximate_market_cap(symbol)
+                logger.debug(f"Market cap for {symbol}: {market_cap}")
                 stock_data[symbol] = {
                     "price": quote["last"],
                     "volume": quote["volume"],
-                    "market_cap": self._get_approximate_market_cap(symbol)
+                    "market_cap": market_cap,
+                    "change_percentage": quote.get("change_percentage", 0.0)
                 }
 
             filtered_stocks = []
@@ -120,11 +126,12 @@ class MarketData:
                 price = data["price"]
                 volume = data["volume"]
                 market_cap = data["market_cap"]
+                change_percentage = data["change_percentage"]
 
                 if (min_price <= price <= max_price and
                     volume >= min_volume and
                     self._match_market_cap_filter(market_cap, market_cap_filter)):
-                    filtered_stocks.append((symbol, price, market_cap, volume))
+                    filtered_stocks.append((symbol, price, market_cap, volume, change_percentage))
 
             return filtered_stocks
 
@@ -137,29 +144,29 @@ class MarketData:
             return []
 
     def _get_approximate_market_cap(self, symbol):
-        """Return approximate market cap (in millions) for demo purposes."""
-        market_caps = {
-            "AAPL": 3000000,
-            "MSFT": 2500000,
-            "GOOGL": 1800000,
-            "AMZN": 1700000,
-            "TSLA": 800000,
-            "NVDA": 600000,
-            "JPM": 500000,
-            "BAC": 300000,
-            "WMT": 400000,
-            "KO": 250000
-        }
-        return market_caps.get(symbol, 0)
+        """Fetch market cap (in millions) using yfinance."""
+        try:
+            logger.debug(f"Fetching market cap for {symbol} using yfinance")
+            ticker = yf.Ticker(symbol)
+            info = ticker.info
+            market_cap = info.get("marketCap", 0)
+            market_cap_millions = market_cap / 1e6
+            logger.debug(f"Market cap for {symbol}: {market_cap_millions} million USD")
+            return market_cap_millions
+        except Exception as e:
+            logger.error(f"Error fetching market cap for {symbol} using yfinance: {str(e)}")
+            return 0
 
     def _match_market_cap_filter(self, market_cap, filter_text):
-        """Match market cap against the selected filter."""
+        """Match market cap (in millions) against the selected filter."""
+        # market_cap is in millions, so convert filter values to millions
+        # $2B = 2,000 million, $10B = 10,000 million
         if filter_text == "Any":
             return True
         elif filter_text == "< $2B":
-            return market_cap < 2000000
+            return market_cap < 2000  # 2,000 million
         elif filter_text == "$2B - $10B":
-            return 2000000 <= market_cap <= 10000000
+            return 2000 <= market_cap <= 10000  # 2,000 to 10,000 million
         elif filter_text == "> $10B":
-            return market_cap > 10000000
+            return market_cap > 10000  # 10,000 million
         return False

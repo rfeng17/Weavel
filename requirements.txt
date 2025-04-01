@@ -1,9 +1,7 @@
 requests
-matplotlib
-mplfinance
-plotly
-tkinterweb
-pandas
+flask
+python-dotenv
+yfinance
 PyQt6
 PyQt6-WebEngine
 schwab-py
