@@ -11,7 +11,7 @@ class Dashboard(QWidget):
     def __init__(self):
         super().__init__()
         self.server_address = Config.FLASK_SERVER_ADDRESS
-        self.setStyleSheet("background-color: #2E3440; color: white; border: none;")
+        self.setStyleSheet("background-color: transparent; color: white; border: none;")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(15, 15, 15, 15)
@@ -56,20 +56,3 @@ class Dashboard(QWidget):
         self.spy_label.setStyleSheet("font-size: 24px; background-color: transparent;")
         stocks_layout.addWidget(self.spy_label)
         tabs.addTab(stocks_tab, "Stocks/Indices")
-
-        # Fetch SPY data
-        self.load_spy_data()
-
-    def load_spy_data(self):
-        """Load SPY market data from the Flask backend."""
-        try:
-            response = requests.get(f"{self.server_address}/api/spy")
-            response.raise_for_status()
-            spy_data = response.json()
-            if spy_data:
-                self.spy_label.setText(f"SPY Data: {spy_data['candles'][0]['close']}")
-            else:
-                self.spy_label.setText("SPY Data: Failed to load")
-        except Exception as e:
-            logger.warning(f"Failed to load SPY data: {str(e)}")
-            self.spy_label.setText(f"SPY Data: Failed to load - {str(e)}")
