@@ -20,14 +20,16 @@ class StockUpdater(QObject):
         self.server_address = server_address
         self.filtered_stocks = []
         self.lock = threading.Lock()
+        self.symbols = []
 
-    def start_update(self, filtered_stocks):
-        if not filtered_stocks:
+    def start_update(self, filtered_stocks, symbols):
+        if not symbols:
             logger.debug("No stocks to update price and volume for.")
             return
 
         with self.lock:
             self.filtered_stocks = filtered_stocks.copy()
+            self.symbols = symbols.copy()  # Store symbols for use in update_price_and_volume
 
         thread = threading.Thread(target=self.update_price_and_volume)
         thread.daemon = True
@@ -36,7 +38,7 @@ class StockUpdater(QObject):
     def update_price_and_volume(self):
         try:
             with self.lock:
-                symbols = [stock[0] for stock in self.filtered_stocks]
+                symbols = self.symbols  # Use the stored symbols
             logger.debug(f"Fetching updated quotes for symbols: {symbols}")
 
             response = requests.post(
@@ -60,20 +62,27 @@ class StockUpdater(QObject):
                         new_price = quote_data[symbol]["price"]
                         new_volume = quote_data[symbol]["volume"]
                         new_change = quote_data[symbol]["change_percentage"]
+                        new_volume_bought = quote_data[symbol].get("volume_bought", stock[5])
+                        new_volume_sold = quote_data[symbol].get("volume_sold", stock[6])
                         if (stock[1] != new_price or
                             stock[3] != new_volume or
-                            stock[4] != new_change):
+                            stock[4] != new_change or
+                            stock[5] != new_volume_bought or
+                            stock[6] != new_volume_sold):
                             has_changes = True
                             self.filtered_stocks[i] = (
                                 symbol,
                                 new_price,
-                                stock[2],
+                                stock[2],  # market_cap
                                 new_volume,
-                                new_change
+                                new_change,
+                                new_volume_bought,
+                                new_volume_sold
                             )
                             if i == 0:
                                 logger.debug(f"Updated {symbol}: Price={new_price}, "
-                                             f"Volume={new_volume}, Change={new_change}")
+                                             f"Volume={new_volume}, Change={new_change}, "
+                                             f"Volume Bought={new_volume_bought}, Volume Sold={new_volume_sold}")
 
             if has_changes:
                 self.update_ui_signal.emit()
@@ -87,7 +96,7 @@ class StockUpdater(QObject):
             logger.error(f"Error updating price and volume: {str(e)}")
         finally:
             self.update_ui_signal.emit()
-
+            
     def get_filtered_stocks(self):
         with self.lock:
             return self.filtered_stocks.copy()
@@ -148,7 +157,9 @@ class StockAdder(QObject):
                 self.error_signal.emit(f"Stock {self.new_symbol} does not meet filter criteria")
                 return
 
-            # Emit the new stock data
+            # Ensure the stock tuple includes volume_bought and volume_sold
+            if len(stock) < 7:  # Expecting 7 fields: symbol, price, market_cap, volume, change, volume_bought, volume_sold
+                stock = tuple(stock) + (0, 0)  # Add default values if not provided
             self.add_stock_signal.emit(stock)
 
         except requests.exceptions.HTTPError as http_err:
@@ -173,14 +184,16 @@ class StockScreener(QWidget):
             except (json.JSONDecodeError, KeyError) as e:
                 logger.error(f"Error reading stocks.json: {str(e)}. Using default symbols.")
                 self.symbols = default_symbols
-                self._save_symbols()  # Save the default symbols to the file
+                self._save_symbols()
         else:
             logger.info("stocks.json not found. Creating with default symbols.")
             self.symbols = default_symbols
-            self._save_symbols()  # Create the file with default symbols
+            self._save_symbols()
         self.filtered_stocks = []
         self.sort_column = -1
         self.sort_order = Qt.AscendingOrder
+        self.lock = threading.Lock()  # Lock for synchronizing access to symbols and filtered_stocks
+        self.is_adding_stock = False  # Flag to prevent concurrent stock additions
         
         self.setStyleSheet("""
             QWidget {
@@ -311,7 +324,7 @@ class StockScreener(QWidget):
         self.stock_updater = StockUpdater(self.server_address, parent=self)
         self.stock_adder = StockAdder(self.server_address, parent=self)
         self.update_timer = QTimer(self)
-        self.update_timer.timeout.connect(self.start_update)
+        self.update_timer.timeout.connect(lambda: self.start_update())  # Ensure correct binding
         self.update_timer.start(15000)
         self.stock_updater.update_ui_signal.connect(self.handle_update)
         self.stock_adder.add_stock_signal.connect(self.handle_add_stock)
@@ -407,21 +420,25 @@ class StockScreener(QWidget):
         # Table and Add Stock Button Layout
         table_container = QVBoxLayout()
 
-        # Results Table
+                # Results Table
         self.results_table = QTableWidget()
-        self.results_table.setColumnCount(5)
+        self.results_table.setColumnCount(7)  # Increased from 5 to 7 for new columns
         self.results_table.setHorizontalHeaderLabels([
             "Symbol", 
             "Price ($)", 
             "Change (%)", 
             "Market Cap ($B)", 
-            "Volume (Shares)"
+            "Volume (Shares)",
+            "Up Volume",  # New column
+            "Down Volume"     # New column
         ])
         logger.debug(f"Header labels set: {self.results_table.horizontalHeaderItem(0).text()}, "
                      f"{self.results_table.horizontalHeaderItem(1).text()}, "
                      f"{self.results_table.horizontalHeaderItem(2).text()}, "
                      f"{self.results_table.horizontalHeaderItem(3).text()}, "
-                     f"{self.results_table.horizontalHeaderItem(4).text()}")
+                     f"{self.results_table.horizontalHeaderItem(4).text()}, "
+                     f"{self.results_table.horizontalHeaderItem(5).text()}, "
+                     f"{self.results_table.horizontalHeaderItem(6).text()}")
         self.results_table.horizontalHeader().setVisible(True)
         logger.debug(f"Header visibility: {self.results_table.horizontalHeader().isVisible()}")
         self.results_table.verticalHeader().setVisible(False)
@@ -429,7 +446,9 @@ class StockScreener(QWidget):
         self.results_table.horizontalHeaderItem(1).setToolTip("Current stock price in USD")
         self.results_table.horizontalHeaderItem(2).setToolTip("Daily price change percentage")
         self.results_table.horizontalHeaderItem(3).setToolTip("Market capitalization in billions of USD")
-        self.results_table.horizontalHeaderItem(4).setToolTip("Trading volume in number of shares")
+        self.results_table.horizontalHeaderItem(4).setToolTip("Total trading volume in number of shares")
+        self.results_table.horizontalHeaderItem(5).setToolTip("Volume of shares bought")
+        self.results_table.horizontalHeaderItem(6).setToolTip("Volume of shares sold")
         for i in range(self.results_table.columnCount()):
             self.results_table.horizontalHeaderItem(i).setTextAlignment(Qt.AlignCenter)
         self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -504,55 +523,73 @@ class StockScreener(QWidget):
                 QMessageBox.information(self, "Info", f"Stock symbol {symbol} is already in the screener.")
                 return
 
-            # Add the symbol with placeholder data and update the UI immediately
-            self.symbols.append(symbol)
-            self._save_symbols()  # Save the updated symbols list
-            placeholder_stock = (symbol, "N/A", 0, 0, 0)  # Placeholder: symbol, price, market cap, volume, change
-            self.filtered_stocks.append(placeholder_stock)
-            self.update_table()
-            logger.debug(f"Temporarily added stock symbol with placeholder: {symbol}. New symbols list: {self.symbols}")
+            # Check if another stock addition is in progress
+            with self.lock:
+                if self.is_adding_stock:
+                    QMessageBox.warning(self, "Warning", "Another stock is being added. Please wait a moment and try again.")
+                    return
+                self.is_adding_stock = True
 
-            # Fetch the actual data for the new stock asynchronously
-            self.loading_bar.setVisible(True)
-            self.add_stock_button.setEnabled(False)
-            self.apply_button.setEnabled(False)
-            self.reset_button.setEnabled(False)
-            self.stock_adder.add_stock(symbol, self.symbols, self.validate_filters())
+            try:
+                # Add the symbol with placeholder data and update the UI immediately
+                with self.lock:
+                    self.symbols.append(symbol)
+                    self._save_symbols()  # Save the updated symbols list
+                    placeholder_stock = (symbol, "N/A", 0, 0, 0, 0, 0)  # Added volume_bought and volume_sold
+                    self.filtered_stocks.append(placeholder_stock)
+                    self.update_table()
+                    logger.debug(f"Temporarily added stock symbol with placeholder: {symbol}. New symbols list: {self.symbols}")
 
-            # Speed up the timer to update in 1 second
-            remaining_time = self.update_timer.remainingTime()
-            if remaining_time > 1000:  # If more than 1 second remains
-                self.update_timer.stop()
-                self.update_timer.start(1000)  # Schedule the next update in 1 second
+                # Fetch the actual data for the new stock asynchronously
+                self.loading_bar.setVisible(True)
+                self.add_stock_button.setEnabled(False)
+                self.apply_button.setEnabled(False)
+                self.reset_button.setEnabled(False)
+                self.stock_adder.add_stock(symbol, self.symbols, self.validate_filters())
+
+                # Speed up the timer to update in 1 second
+                remaining_time = self.update_timer.remainingTime()
+                if remaining_time > 1000:  # If more than 1 second remains
+                    self.update_timer.stop()
+                    self.update_timer.start(1000)  # Schedule the next update in 1 second
+            except Exception as e:
+                logger.error(f"Error adding stock {symbol}: {str(e)}")
+                with self.lock:
+                    self.is_adding_stock = False
+                raise
 
     @Slot(tuple)
     def handle_add_stock(self, new_stock):
         """Handle the signal from StockAdder when stock addition is successful."""
-        # Replace the placeholder entry with the actual data
-        for i, stock in enumerate(self.filtered_stocks):
-            if stock[0] == new_stock[0]:  # Match by symbol
-                self.filtered_stocks[i] = new_stock
-                break
-        # Update the table only if StockUpdater isn't about to run
-        if not self.update_timer.isActive():
-            self.update_table()
-        logger.debug(f"Successfully updated stock {new_stock[0]}. New filtered stocks: {self.filtered_stocks}")
-        self.loading_bar.setVisible(False)
-        self.add_stock_button.setEnabled(True)
-        self.apply_button.setEnabled(True)
-        self.reset_button.setEnabled(True)
+        with self.lock:
+            # Replace the placeholder entry with the actual data
+            for i, stock in enumerate(self.filtered_stocks):
+                if stock[0] == new_stock[0]:  # Match by symbol
+                    self.filtered_stocks[i] = new_stock
+                    break
+            # Update the table only if StockUpdater isn't about to run
+            if not self.update_timer.isActive():
+                self.update_table()
+            logger.debug(f"Successfully updated stock {new_stock[0]}. New filtered stocks: {self.filtered_stocks}")
+            self.loading_bar.setVisible(False)
+            self.add_stock_button.setEnabled(True)
+            self.apply_button.setEnabled(True)
+            self.reset_button.setEnabled(True)
+            self.is_adding_stock = False  # Release the lock
         
     @Slot(str)
     def handle_add_stock_error(self, error_message):
         """Handle the error signal from StockAdder when stock addition fails."""
-        # Remove the last added symbol and its placeholder since it failed
-        if self.symbols:
-            failed_symbol = self.symbols[-1]
-            self.symbols.pop()
-            self._save_symbols()  # Save the updated symbols list
-            self.filtered_stocks = [stock for stock in self.filtered_stocks if stock[0] != failed_symbol]
-            self.update_table()
-            logger.debug(f"Removed failed stock symbol: {failed_symbol}. New symbols list: {self.symbols}")
+        with self.lock:
+            # Remove the last added symbol and its placeholder since it failed
+            if self.symbols:
+                failed_symbol = self.symbols[-1]
+                self.symbols.pop()
+                self._save_symbols()  # Save the updated symbols list
+                self.filtered_stocks = [stock for stock in self.filtered_stocks if stock[0] != failed_symbol]
+                self.update_table()
+                logger.debug(f"Removed failed stock symbol: {failed_symbol}. New symbols list: {self.symbols}")
+            self.is_adding_stock = False  # Release the lock
         QMessageBox.critical(self, "Error", f"Failed to add stock: {error_message}")
         self.loading_bar.setVisible(False)
         self.add_stock_button.setEnabled(True)
@@ -651,6 +688,9 @@ class StockScreener(QWidget):
                     invalid_symbols.append(symbol)
                     continue
                 if filters["min_change"] <= change_percentage <= filters["max_change"]:
+                    # Ensure the stock tuple includes volume_bought and volume_sold
+                    if len(stock) < 7:  # Expecting 7 fields
+                        stock = tuple(stock) + (0, 0)  # Add default values if not provided
                     filtered_stocks.append(stock)
             self.filtered_stocks = filtered_stocks
 
@@ -684,9 +724,11 @@ class StockScreener(QWidget):
 
         self.results_table.setRowCount(len(self.filtered_stocks))
         for row, stock in enumerate(self.filtered_stocks):
-            symbol, price, market_cap, volume, change_percentage = stock
+            symbol, price, market_cap, volume, change_percentage, volume_bought, volume_sold = stock
             if row == 0:
-                logger.debug(f"Processing stock: {symbol}, Price: {price}, Market Cap: {market_cap}, Volume: {volume}, Change: {change_percentage}")
+                logger.debug(f"Processing stock: {symbol}, Price: {price}, Market Cap: {market_cap}, "
+                             f"Volume: {volume}, Change: {change_percentage}, "
+                             f"Buy Volume: {volume_bought}, Sell Volume: {volume_sold}")  # Updated terminology
             
             self.results_table.setItem(row, 0, QTableWidgetItem(str(symbol)))
             # Handle price: display as-is if it's a string, otherwise format as float
@@ -708,6 +750,12 @@ class StockScreener(QWidget):
             # Handle volume: display as-is if it's a string, otherwise format with commas
             volume_display = volume if isinstance(volume, str) else f"{int(volume):,}"
             self.results_table.setItem(row, 4, QTableWidgetItem(volume_display))
+            # Handle buy volume: display as-is if it's a string, otherwise format with commas
+            volume_bought_display = volume_bought if isinstance(volume_bought, str) else f"{int(volume_bought):,}"
+            self.results_table.setItem(row, 5, QTableWidgetItem(volume_bought_display))
+            # Handle sell volume: display as-is if it's a string, otherwise format with commas
+            volume_sold_display = volume_sold if isinstance(volume_sold, str) else f"{int(volume_sold):,}"
+            self.results_table.setItem(row, 6, QTableWidgetItem(volume_sold_display))
 
         self.results_table.resizeColumnsToContents()
         self.results_table.horizontalHeader().setVisible(True)
@@ -728,13 +776,15 @@ class StockScreener(QWidget):
         """Trigger the update process in StockUpdater."""
         if show_loading_bar:
             self.loading_bar.setVisible(True)
-        self.stock_updater.start_update(self.filtered_stocks)
-
+        with self.lock:
+            self.stock_updater.start_update(self.filtered_stocks, self.symbols)
+            
     @Slot()
     def handle_update(self, hide_loading_bar=True):
         """Handle the update signal from StockUpdater by updating filtered_stocks and the UI."""
-        self.filtered_stocks = self.stock_updater.get_filtered_stocks()
-        self.update_table()
+        with self.lock:
+            self.filtered_stocks = self.stock_updater.get_filtered_stocks()
+            self.update_table()
         if hide_loading_bar:
             self.loading_bar.setVisible(False)
         # Revert the timer to its regular 15-second interval if it was sped up
