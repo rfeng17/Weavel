@@ -5,7 +5,7 @@ import logging
 import requests
 import threading
 from flask_app.config import Config
-from components.screener.table_edit import TableEdit
+from components.screener.table_edit import TableEdit, CustomTableWidget
 import json
 import os
 
@@ -115,7 +115,6 @@ class StockAdder(QObject):
         """Add a new stock and fetch its data in a separate thread."""
         self.new_symbol = new_symbol  # Store the new symbol for use in _fetch_and_filter_stocks
         self.all_symbols = all_symbols  # Store all symbols for validation
-        self.filters = filters
         thread = threading.Thread(target=self._fetch_and_filter_stocks)
         thread.daemon = True
         thread.start()
@@ -125,11 +124,7 @@ class StockAdder(QObject):
         try:
             # Request data for only the new stock
             request_data = {
-                "symbols": [self.new_symbol],
-                "min_price": self.filters["min_price"],
-                "max_price": self.filters["max_price"],
-                "min_volume": self.filters["min_volume"],
-                "market_cap_filter": self.filters["market_cap_filter"]
+                "symbols": [self.new_symbol]
             }
             logger.debug(f"Sending request to backend for new stock {self.new_symbol}: {request_data}")
             response = requests.post(
@@ -151,10 +146,6 @@ class StockAdder(QObject):
             if change_percentage is None:
                 logger.warning(f"Stock {symbol}: change percentage is None")
                 self.error_signal.emit(f"Ticker not found: {self.new_symbol}")
-                return
-
-            if not (self.filters["min_change"] <= change_percentage <= self.filters["max_change"]):
-                self.error_signal.emit(f"Stock {self.new_symbol} does not meet filter criteria")
                 return
 
             # Ensure the stock tuple includes volume_bought and volume_sold
@@ -343,85 +334,11 @@ class StockScreener(QWidget):
         header_LabeL.setAlignment(Qt.AlignCenter)
         layout.addWidget(header_LabeL)
 
-        # Filter Section
-        filter_container = QWidget()
-        filter_container.setStyleSheet("background-color: #434C5E; border-radius: 10px; padding: 10px;")
-        filter_layout = QHBoxLayout(filter_container)
-        filter_layout.setSpacing(15)
-
-        # Price Range Filter
-        price_layout = QVBoxLayout()
-        price_label = QLabel("Price Range ($)")
-        price_label.setToolTip("Filter stocks by price range (e.g., $100 to $200)")
-        price_layout.addWidget(price_label)
-        price_input_layout = QHBoxLayout()
-        self.min_price = QLineEdit()
-        self.min_price.setPlaceholderText("Min Price")
-        self.min_price.setToolTip("Enter the minimum price (e.g., 100)")
-        price_input_layout.addWidget(self.min_price)
-        self.max_price = QLineEdit()
-        self.max_price.setPlaceholderText("Max Price")
-        self.max_price.setToolTip("Enter the maximum price (e.g., 200), or leave blank for no limit")
-        price_input_layout.addWidget(self.max_price)
-        price_layout.addLayout(price_input_layout)
-        filter_layout.addLayout(price_layout)
-
-        # Price Change Filter
-        change_layout = QVBoxLayout()
-        change_label = QLabel("Price Change (%)")
-        change_label.setToolTip("Filter stocks by daily price change percentage (e.g., -5 to 5)")
-        change_layout.addWidget(change_label)
-        change_input_layout = QHBoxLayout()
-        self.min_change = QLineEdit()
-        self.min_change.setPlaceholderText("Min Change")
-        self.min_change.setToolTip("Enter the minimum price change percentage (e.g., -5)")
-        change_input_layout.addWidget(self.min_change)
-        self.max_change = QLineEdit()
-        self.max_change.setPlaceholderText("Max Change")
-        self.max_change.setToolTip("Enter the maximum price change percentage (e.g., 5), or leave blank for no limit")
-        change_input_layout.addWidget(self.max_change)
-        change_layout.addLayout(change_input_layout)
-        filter_layout.addLayout(change_layout)
-
-        # Market Cap Filter
-        market_cap_layout = QVBoxLayout()
-        market_cap_label = QLabel("Market Cap")
-        market_cap_label.setToolTip("Filter stocks by market capitalization")
-        market_cap_layout.addWidget(market_cap_label)
-        self.market_cap_filter = QComboBox()
-        self.market_cap_filter.addItems(["Any", "< $2B", "$2B - $10B", "> $10B"])
-        self.market_cap_filter.setToolTip("Select a market cap range")
-        market_cap_layout.addWidget(self.market_cap_filter)
-        filter_layout.addLayout(market_cap_layout)
-
-        # Volume Filter
-        volume_layout = QVBoxLayout()
-        volume_label = QLabel("Min Volume")
-        volume_label.setToolTip("Filter stocks by minimum trading volume")
-        volume_layout.addWidget(volume_label)
-        self.min_volume = QLineEdit()
-        self.min_volume.setPlaceholderText("e.g., 1000000")
-        self.min_volume.setToolTip("Enter the minimum trading volume (e.g., 1000000)")
-        volume_layout.addWidget(self.min_volume)
-        filter_layout.addLayout(volume_layout)
-
-        layout.addWidget(filter_container)
-
-        # Button Layout
-        button_layout = QHBoxLayout()
-        self.apply_button = QPushButton("Apply")
-        self.apply_button.clicked.connect(self.screen_stocks)
-        button_layout.addWidget(self.apply_button)
-        self.reset_button = QPushButton("Reset")
-        self.reset_button.clicked.connect(self.reset_filters)
-        button_layout.addWidget(self.reset_button)
-        layout.addLayout(button_layout)
-
         # Table and Add Stock Button Layout
         table_container = QVBoxLayout()
 
-                # Results Table
-        self.results_table = QTableWidget()
+        # Results Table
+        self.results_table = CustomTableWidget()
         self.results_table.setColumnCount(7)  # Increased from 5 to 7 for new columns
         self.results_table.setHorizontalHeaderLabels([
             "Symbol", 
@@ -543,9 +460,7 @@ class StockScreener(QWidget):
                 # Fetch the actual data for the new stock asynchronously
                 self.loading_bar.setVisible(True)
                 self.add_stock_button.setEnabled(False)
-                self.apply_button.setEnabled(False)
-                self.reset_button.setEnabled(False)
-                self.stock_adder.add_stock(symbol, self.symbols, self.validate_filters())
+                self.stock_adder.add_stock(symbol, self.symbols)
 
                 # Speed up the timer to update in 1 second
                 remaining_time = self.update_timer.remainingTime()
@@ -573,8 +488,6 @@ class StockScreener(QWidget):
             logger.debug(f"Successfully updated stock {new_stock[0]}. New filtered stocks: {self.filtered_stocks}")
             self.loading_bar.setVisible(False)
             self.add_stock_button.setEnabled(True)
-            self.apply_button.setEnabled(True)
-            self.reset_button.setEnabled(True)
             self.is_adding_stock = False  # Release the lock
         
     @Slot(str)
@@ -593,81 +506,21 @@ class StockScreener(QWidget):
         QMessageBox.critical(self, "Error", f"Failed to add stock: {error_message}")
         self.loading_bar.setVisible(False)
         self.add_stock_button.setEnabled(True)
-        self.apply_button.setEnabled(True)
-        self.reset_button.setEnabled(True)
         # Speed up the timer to update in 1 second
         remaining_time = self.update_timer.remainingTime()
         if remaining_time > 1000:  # If more than 1 second remains
             self.update_timer.stop()
             self.update_timer.start(1000)  # Schedule the next update in 1 second
 
-    def validate_filters(self):
-        """Validate all filter inputs and return the parsed values."""
-        filters = {
-            "min_price": 0,
-            "max_price": 1e9,
-            "min_change": -1e9,
-            "max_change": 1e9,
-            "min_volume": 0,
-            "market_cap_filter": "Any"
-        }
-
-        if self.min_price.text():
-            if not self.is_valid_float(self.min_price.text()):
-                raise ValueError("Minimum price must be a valid number")
-            filters["min_price"] = float(self.min_price.text())
-        if self.max_price.text():
-            if not self.is_valid_float(self.max_price.text()):
-                raise ValueError("Maximum price must be a valid number")
-            filters["max_price"] = float(self.max_price.text())
-
-        if self.min_change.text():
-            if not self.is_valid_float(self.min_change.text()):
-                raise ValueError("Minimum price change must be a valid number")
-            filters["min_change"] = float(self.min_change.text())
-        if self.max_change.text():
-            if not self.is_valid_float(self.max_change.text()):
-                raise ValueError("Maximum price change must be a valid number")
-            filters["max_change"] = float(self.max_change.text())
-
-        if self.min_volume.text():
-            if not self.is_valid_int(self.min_volume.text()):
-                raise ValueError("Minimum volume must be a valid integer")
-            filters["min_volume"] = int(self.min_volume.text())
-
-        filters["market_cap_filter"] = self.market_cap_filter.currentText()
-
-        return filters
-
-    def reset_filters(self):
-        """Reset all filters to their default values and refresh the table."""
-        self.min_price.clear()
-        self.max_price.clear()
-        self.min_change.clear()
-        self.max_change.clear()
-        self.min_volume.clear()
-        self.market_cap_filter.setCurrentText("Any")
-        self.sort_column = -1
-        self.sort_order = Qt.AscendingOrder
-        self.screen_stocks()
-
     def screen_stocks(self):
         """Fetch and display filtered stock data from the Flask backend."""
         try:
-            filters = self.validate_filters()
-
             self.loading_bar.setVisible(True)
-            self.apply_button.setEnabled(False)
-            self.reset_button.setEnabled(False)
             self.add_stock_button.setEnabled(False)
             self.results_table.setRowCount(0)
 
             request_data = {
-                "symbols": self.symbols,
-                "min_price": filters["min_price"],
-                "max_price": filters["max_price"],
-                "min_volume": filters["min_volume"],
-                "market_cap_filter": filters["market_cap_filter"]
+                "symbols": self.symbols
             }
             logger.debug(f"Sending request to backend: {request_data}")
             response = requests.post(
@@ -687,11 +540,10 @@ class StockScreener(QWidget):
                     logger.warning(f"Stock {symbol}: change percentage is None")
                     invalid_symbols.append(symbol)
                     continue
-                if filters["min_change"] <= change_percentage <= filters["max_change"]:
-                    # Ensure the stock tuple includes volume_bought and volume_sold
-                    if len(stock) < 7:  # Expecting 7 fields
-                        stock = tuple(stock) + (0, 0)  # Add default values if not provided
-                    filtered_stocks.append(stock)
+                # Ensure the stock tuple includes volume_bought and volume_sold
+                if len(stock) < 7:  # Expecting 7 fields
+                    stock = tuple(stock) + (0, 0)  # Add default values if not provided
+                filtered_stocks.append(stock)
             self.filtered_stocks = filtered_stocks
 
             if invalid_symbols:
@@ -707,8 +559,6 @@ class StockScreener(QWidget):
             QMessageBox.critical(self, "Error", f"Error screening stocks: {str(e)}")
         finally:
             self.loading_bar.setVisible(False)
-            self.apply_button.setEnabled(True)
-            self.reset_button.setEnabled(True)
             self.add_stock_button.setEnabled(True)
 
     @Slot()
