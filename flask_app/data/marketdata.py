@@ -6,7 +6,6 @@ import yfinance as yf
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from collections import defaultdict
-import tenacity
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from flask_app.config import Config
 from flask_app.data.market_calendar import MarketCalendar
@@ -152,15 +151,11 @@ class MarketData:
             logger.error(f"Error fetching price history for {symbol}: {str(e)}")
             return None
 
-    def screen_stocks(self, symbols, min_price=0, max_price=1e9, min_volume=0, market_cap_filter="Any"):
+    def screen_stocks(self, symbols):
         """
-        Screen stocks based on given criteria using Tradier quotes.
+        Fetch stock data for the given symbols using Tradier quotes.
         Args:
-            symbols: List of stock symbols to screen.
-            min_price: Minimum stock price.
-            max_price: Maximum stock price.
-            min_volume: Minimum trading volume.
-            market_cap_filter: Market cap filter ("Any", or specific ranges).
+            symbols: List of stock symbols to fetch.
         Returns:
             List of tuples: (symbol, price, market_cap, volume, change_percentage, bid, ask)
         """
@@ -206,14 +201,23 @@ class MarketData:
                 logger.error(f"Tradier API returned null quotes for symbols: {symbols_str}")
                 return []
 
+            # Ensure quotes is a list
             if isinstance(quotes, dict):
                 quotes = [quotes]
-            quotes_list = quotes
+            elif isinstance(quotes, str):
+                logger.error(f"Tradier API returned a string instead of a quote object: {quotes}")
+                return []
+            elif not isinstance(quotes, list):
+                logger.error(f"Tradier API returned unexpected quote type: {type(quotes)}, value: {quotes}")
+                return []
 
-            stock_data = {}
+            quotes_list = quotes
+            logger.debug(f"Parsed quotes_list: {quotes_list}")
+
+            stock_data = []
             for quote in quotes_list:
                 if not isinstance(quote, dict):
-                    logger.warning(f"Skipping invalid quote entry: {quote}")
+                    logger.warning(f"Skipping invalid quote entry (not a dict): {quote}")
                     continue
                 raw_symbol = quote.get("symbol")
                 if not raw_symbol:
@@ -223,35 +227,21 @@ class MarketData:
                 logger.debug(f"Raw symbol: {raw_symbol}, Normalized symbol: {symbol}")
                 market_cap = self._get_approximate_market_cap(symbol)
                 logger.debug(f"Market cap for {symbol}: {market_cap}")
-                stock_data[symbol] = {
-                    "price": quote.get("last", 0),
-                    "volume": quote.get("volume", 0),
-                    "market_cap": market_cap,
-                    "change_percentage": quote.get("change_percentage", 0.0),
-                    "bid": quote.get("bid", 0),
-                    "ask": quote.get("ask", 0)
-                }
+                stock_data.append((
+                    symbol,
+                    quote.get("last", 0),
+                    market_cap,
+                    quote.get("volume", 0),
+                    quote.get("change_percentage", 0.0),
+                    quote.get("bid", 0),
+                    quote.get("ask", 0)
+                ))
 
-            filtered_stocks = []
-            for symbol, data in stock_data.items():
-                price = data["price"]
-                volume = data["volume"]
-                market_cap = data["market_cap"]
-                change_percentage = data["change_percentage"]
+            logger.debug(f"Returning stock_data: {stock_data}")
+            return stock_data
 
-                if (min_price <= price <= max_price and
-                    volume >= min_volume and
-                    self._match_market_cap_filter(market_cap, market_cap_filter)):
-                    filtered_stocks.append((symbol, price, market_cap, volume, change_percentage, data["bid"], data["ask"]))
-
-            return filtered_stocks
-
-        except requests.exceptions.HTTPError as http_err:
-            logger.error(f"HTTP Error screening stocks: {str(http_err)}")
-            logger.error(f"Response Text: {http_err.response.text if http_err.response else 'No response'}")
-            return []
         except Exception as e:
-            logger.error(f"Error screening stocks: {str(e)}")
+            logger.error(f"Error in screen_stocks: {str(e)}")
             return []
         
     def get_buy_sell_volume(self, symbols, bid_ask_data=None, force_refresh=False):
@@ -565,15 +555,3 @@ class MarketData:
         except Exception as e:
             logger.error(f"Error fetching market cap for {symbol} using yfinance: {str(e)}")
             return 0
-
-    def _match_market_cap_filter(self, market_cap, filter_text):
-        """Match market cap (in millions) against the selected filter."""
-        if filter_text == "Any":
-            return True
-        elif filter_text == "< $2B":
-            return market_cap < 2000
-        elif filter_text == "$2B - $10B":
-            return 2000 <= market_cap <= 10000
-        elif filter_text == "> $10B":
-            return market_cap > 10000
-        return False
