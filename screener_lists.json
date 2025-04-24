@@ -1,0 +1,23 @@
+[
+    {
+        "name": "Tech",
+        "symbols": [
+            "AAPL",
+            "MSFT",
+            "GOOGL",
+            "QQQ",
+            "PLTR"
+        ]
+    },
+    {
+        "name": "Semis",
+        "symbols": [
+            "SOXL",
+            "MU",
+            "NVDA",
+            "AMD",
+            "AVGO",
+            "QCOM"
+        ]
+    }
+]

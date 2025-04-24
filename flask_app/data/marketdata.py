@@ -1,8 +1,9 @@
 import time
 import logging
-import requests
-import threading
+import aiohttp
+import tenacity
 import yfinance as yf
+import asyncio
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from collections import defaultdict
@@ -15,78 +16,88 @@ logger = logging.getLogger(__name__)
 
 class MarketData:
     def __init__(self):
-        self.use_alpaca = False  # Set to False to use Tradier for market data
         self.tradier_base_url = Config.TRADIER_BASE_URL
         self.tradier_headers = {
             "Authorization": f"Bearer {Config.TRADIER_API_TOKEN}",
             "Accept": "application/json"
         }
-        # Alpaca API for news data
         self.alpaca_base_url = Config.ALPACA_BASE_URL
         self.alpaca_headers = {
             "APCA-API-KEY-ID": Config.ALPACA_API_KEY,
-            "APCA-API-SECRET-KEY": Config.ALPACA_SECRET_KEY
+            "APCA-API-SECRET-KEY": Config.ALPACA_SECRET_KEY,
+            "Accept": "application/json"
         }
-        # Initialize StockSentiment for news sentiment analysis
+        self.rate_limit_per_second = 2  # Tradier rate limit: 2 requests/sec
+        self.alpaca_rate_limit_per_second = 3.33  # Alpaca rate limit: 200 requests/minute
+        self.last_request_time = 0
+        self.last_alpaca_request_time = 0
+        self.lock = asyncio.Lock()
+        self.cache_ttl = 10
+        self.stock_cache = {}
+        self.buy_sell_cache = {}
         self.stock_sentiment = StockSentiment(
             alpaca_base_url=self.alpaca_base_url,
             alpaca_headers=self.alpaca_headers,
-            rate_limit_per_second=3.33  # Alpaca's rate limit for news
+            rate_limit_per_second=self.alpaca_rate_limit_per_second
         )
-        self.buy_sell_cache = {}
-        self.cache_ttl = 60
-        
-        # Rate limiting: 200 requests per minute for Alpaca free tier (3.33 requests per second)
-        # Tradier: 120 requests per minute (2 requests per second)
-        self.rate_limit_per_second = 2  # Use Tradier's rate limit for market data
-        self.last_request_time = 0
-        self.lock = threading.Lock()
-        self.market_calendar = MarketCalendar(timezone=Config.TIMEZONE)
-        
-    def _rate_limit(self):
-        """Enforce rate limiting to avoid exceeding API limits."""
-        with self.lock:
+        self.market_calendar = MarketCalendar()
+
+    async def _rate_limit(self, use_alpaca=True):
+        async with self.lock:
             current_time = time.time()
-            time_since_last = current_time - self.last_request_time
-            if time_since_last < (1 / self.rate_limit_per_second):
-                time.sleep((1 / self.rate_limit_per_second) - time_since_last)
-            self.last_request_time = time.time()
+            if use_alpaca:
+                time_since_last = current_time - self.last_alpaca_request_time
+                rate_limit = self.alpaca_rate_limit_per_second
+                last_request_time_ref = 'last_alpaca_request_time'
+            else:
+                time_since_last = current_time - self.last_request_time
+                rate_limit = self.rate_limit_per_second
+                last_request_time_ref = 'last_request_time'
+
+            sleep_time = (1 / rate_limit) - time_since_last
+            if sleep_time > 0:
+                logger.debug(f"Rate limiting {'Alpaca' if use_alpaca else 'Tradier'}: sleeping for {sleep_time:.2f} seconds")
+                await asyncio.sleep(sleep_time)
+            setattr(self, last_request_time_ref, current_time)
 
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type(requests.exceptions.HTTPError),
+        retry=retry_if_exception_type(aiohttp.ClientResponseError),
         before_sleep=lambda retry_state: logger.debug(f"Retrying API request (attempt {retry_state.attempt_number})...")
     )
-    def _make_api_request(self, url, params, use_alpaca=False):
-        """Make an API request with rate limiting and retry logic."""
-        self._rate_limit()
-        # Use Alpaca for news, Tradier for market data
+    async def _make_api_request(self, url, params, use_alpaca=True):
+        await self._rate_limit(use_alpaca)
         headers = self.alpaca_headers if use_alpaca else self.tradier_headers
-        response = requests.get(url, headers=headers, params=params)
-        response.raise_for_status()
-        return response
-        
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(url, params=params) as response:
+                try:
+                    response.raise_for_status()
+                    return await response.json()
+                except aiohttp.ClientResponseError as e:
+                    error_response = "No response body"
+                    try:
+                        error_response = await response.text()
+                    except Exception as log_err:
+                        logger.error(f"Failed to fetch error response body: {str(log_err)}")
+                    logger.error(f"ClientResponseError in API request to {url}: Status={e.status}, Message={e.message}, Response={error_response}")
+                    raise
+
     def _validate_symbol(self, symbol):
-        """Validate that a symbol is a valid U.S. stock ticker."""
         if not isinstance(symbol, str):
             return False
-        # U.S. stock tickers are typically 1-5 uppercase letters, optionally with a suffix (e.g., "BRK.A")
         import re
         pattern = r"^[A-Z]{1,5}(\.[A-Z])?$"
         return bool(re.match(pattern, symbol))
-    
-    def get_spy_data(self):
-        """Fetch SPY market data (latest quote)."""
+
+    async def get_spy_data(self):
         try:
             logger.debug("Fetching SPY data from Tradier API")
-            response = requests.get(
-                f"{self.base_url}/markets/quotes",
-                headers=self.headers,
-                params={"symbols": "SPY"}
+            data = await self._make_api_request(
+                f"{self.tradier_base_url}/markets/quotes",
+                params={"symbols": "SPY"},
+                use_alpaca=False
             )
-            response.raise_for_status()
-            data = response.json()
             logger.debug(f"Tradier API Response: {data}")
             quote = data["quotes"]["quote"]
             return {
@@ -96,16 +107,11 @@ class MarketData:
                     "datetime": quote["trade_date"]
                 }]
             }
-        except requests.exceptions.HTTPError as http_err:
-            logger.error(f"HTTP Error fetching SPY data: {str(http_err)}")
-            logger.error(f"Response Text: {http_err.response.text if http_err.response else 'No response'}")
-            return None
         except Exception as e:
             logger.error(f"Error fetching SPY data: {str(e)}")
             return None
 
-    def get_price_history(self, symbol, period_type="day", period="1", frequency_type="minute", frequency=1):
-        """Fetch price history for a given symbol using Tradier's history endpoint."""
+    async def get_price_history(self, symbol, period_type="day", period="1", frequency_type="minute", frequency=1):
         try:
             interval_map = {
                 "minute": {
@@ -119,136 +125,204 @@ class MarketData:
             }
             interval = interval_map.get(frequency_type.lower(), {}).get(frequency, "daily")
 
-            logger.debug(f"Fetching price history for {symbol} with interval {interval}")
-            response = requests.get(
-                f"{self.base_url}/markets/history",
-                headers=self.headers,
-                params={
-                    "symbol": symbol,
-                    "interval": interval,
-                    "start": "2025-03-25",
-                    "end": "2025-03-30"
+            current_time = datetime.utcnow().replace(tzinfo=ZoneInfo("UTC"))
+            if frequency_type.lower() == "minute":
+                # Use Alpaca API for intraday data, but ensure data is at least 30 minutes delayed
+                end_time = current_time - timedelta(minutes=30)
+                start_time = end_time - timedelta(minutes=15)
+                start_str_alpaca = start_time.isoformat()
+                end_str_alpaca = end_time.isoformat()
+
+                logger.debug(f"Fetching price history for {symbol} with interval {interval} using Alpaca API")
+                alpaca_interval = f"{frequency}Min" if frequency in [1, 5, 15] else "5Min"
+                params = {
+                    "symbols": symbol,
+                    "timeframe": alpaca_interval,
+                    "start": start_str_alpaca,
+                    "end": end_str_alpaca
                 }
-            )
-            response.raise_for_status()
-            data = response.json()
-            logger.debug(f"Tradier API Response: {data}")
-            history = data["history"]["day"]
-            candles = [
-                {
-                    "close": day["close"],
-                    "volume": day["volume"],
-                    "datetime": day["date"]
-                }
-                for day in history
-            ]
-            return {"candles": candles}
-        except requests.exceptions.HTTPError as http_err:
-            logger.error(f"HTTP Error fetching price history for {symbol}: {str(http_err)}")
-            logger.error(f"Response Text: {http_err.response.text if http_err.response else 'No response'}")
-            return None
+                alpaca_url = f"{self.alpaca_base_url.rstrip('/')}/v2/stocks/bars"
+                data = await self._make_api_request(
+                    alpaca_url,
+                    params=params,
+                    use_alpaca=True
+                )
+                logger.debug(f"Alpaca API Response: {data}")
+                # Handle both possible structures: bars as a list or bars as a dict with symbol keys
+                bars_data = data.get("bars", [])
+                if isinstance(bars_data, dict):
+                    bars = bars_data.get(symbol, [])
+                else:
+                    bars = bars_data
+                if not bars or not isinstance(bars, list) or not all(isinstance(bar, dict) for bar in bars):
+                    logger.warning(f"No valid timesales data available for {symbol} from Alpaca. Response: {data}")
+                    return {"candles": []}
+
+                candles = [
+                    {
+                        "close": bar["c"],
+                        "volume": bar["v"],
+                        "datetime": bar["t"]
+                    }
+                    for bar in bars
+                ]
+                return {"candles": candles}
+            else:
+                # Use Tradier for daily, weekly, monthly data
+                end_date = current_time.astimezone(self.market_calendar.timezone).date()
+                start_date = end_date - timedelta(days=int(period))
+                start_str = start_date.strftime("%Y-%m-%d")
+                end_str = end_date.strftime("%Y-%m-%d")
+
+                logger.debug(f"Fetching price history for {symbol} with interval {interval} using Tradier history")
+                data = await self._make_api_request(
+                    f"{self.tradier_base_url}/markets/history",
+                    params={
+                        "symbol": symbol,
+                        "interval": interval,
+                        "start": start_str,
+                        "end": end_str
+                    },
+                    use_alpaca=False
+                )
+                logger.debug(f"Tradier API Response: {data}")
+                history = data.get("history", {}).get("day", [])
+                if not history:
+                    logger.warning(f"No history data available for {symbol}")
+                    return {"candles": []}
+
+                if isinstance(history, dict):
+                    history = [history]
+
+                candles = [
+                    {
+                        "close": day["close"],
+                        "volume": day["volume"],
+                        "datetime": day["date"]
+                    }
+                    for day in history
+                ]
+                return {"candles": candles}
+
         except Exception as e:
             logger.error(f"Error fetching price history for {symbol}: {str(e)}")
-            return None
+            # Fallback: Use recent quote data to estimate trend
+            try:
+                quote_data = await self._make_api_request(
+                    f"{self.tradier_base_url}/markets/quotes",
+                    params={"symbols": symbol},
+                    use_alpaca=False
+                )
+                quote = quote_data.get("quotes", {}).get("quote", {})
+                if isinstance(quote, list):
+                    quote = quote[0] if quote else {}
+                last_price = quote.get("last", 0) or quote.get("close", 0)
+                prev_close = quote.get("prevclose", 0) or last_price
+                start_str = (current_time - timedelta(minutes=15)).strftime("%Y-%m-%d %H:%M:%S")
+                end_str = (current_time - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
+                candles = [
+                    {
+                        "close": prev_close,
+                        "volume": quote.get("volume", 0),
+                        "datetime": quote.get("trade_date", start_str)
+                    },
+                    {
+                        "close": last_price,
+                        "volume": quote.get("volume", 0),
+                        "datetime": quote.get("trade_date", end_str)
+                    }
+                ]
+                return {"candles": candles}
+            except Exception as fallback_err:
+                logger.error(f"Fallback failed for {symbol}: {str(fallback_err)}")
+                return {"candles": []}
 
-    def screen_stocks(self, symbols):
-        """
-        Fetch stock data for the given symbols using Tradier quotes.
-        Args:
-            symbols: List of stock symbols to fetch.
-        Returns:
-            List of tuples: (symbol, price, market_cap, volume, change_percentage, bid, ask)
-        """
+    async def screen_stocks(self, symbols):
+        if not symbols:
+            return []
+
+        valid_symbols = [symbol for symbol in symbols if self._validate_symbol(symbol)]
+        if not valid_symbols:
+            logger.error("No valid symbols provided for screening.")
+            return []
+        if len(valid_symbols) < len(symbols):
+            invalid_symbols = set(symbols) - set(valid_symbols)
+            logger.warning(f"Skipping invalid symbols for screening: {invalid_symbols}")
+
+        results = []
+        valid_symbols_str = ",".join(valid_symbols)
+        logger.debug(f"Fetching quotes for symbols: {valid_symbols_str}")
+
         try:
-            if not symbols:
-                return []
-
-            # Validate symbols
-            valid_symbols = [symbol for symbol in symbols if self._validate_symbol(symbol)]
-            if not valid_symbols:
-                logger.error("No valid symbols provided for screening.")
-                return []
-            if len(valid_symbols) < len(symbols):
-                invalid_symbols = set(symbols) - set(valid_symbols)
-                logger.warning(f"Skipping invalid symbols: {invalid_symbols}")
-
-            # Batch request for all symbols using Tradier API
-            symbols_str = ",".join(valid_symbols)
-            logger.debug(f"Fetching quotes for symbols: {symbols_str}")
-            response = self._make_api_request(
+            quote_data = await self._make_api_request(
                 f"{self.tradier_base_url}/markets/quotes",
-                params={"symbols": symbols_str},
-                use_alpaca=False  # Use Tradier for market data
+                params={"symbols": valid_symbols_str},
+                use_alpaca=False
             )
-            raw_response = response.text
-            logger.debug(f"Raw Tradier API Response: {raw_response}")
-            data = response.json()
-            if not isinstance(data, dict) or "quotes" not in data:
-                logger.error(f"Invalid Tradier API response: {data}")
-                return []
-
-            quotes_data = data["quotes"]
-            if not isinstance(quotes_data, dict):
-                logger.error(f"Tradier API returned invalid quotes data: {quotes_data}")
-                return []
-
-            if "quote" not in quotes_data:
-                logger.error(f"No quote data available in Tradier API response: {quotes_data}")
-                return []
-
-            quotes = quotes_data["quote"]
+            logger.debug(f"Tradier API Response: {quote_data}")
+            quotes = quote_data.get("quotes", {}).get("quote", [])
             if quotes is None:
-                logger.error(f"Tradier API returned null quotes for symbols: {symbols_str}")
+                logger.warning(f"No quote data available for {valid_symbols_str} (quotes is null).")
                 return []
 
-            # Ensure quotes is a list
             if isinstance(quotes, dict):
                 quotes = [quotes]
-            elif isinstance(quotes, str):
-                logger.error(f"Tradier API returned a string instead of a quote object: {quotes}")
-                return []
-            elif not isinstance(quotes, list):
-                logger.error(f"Tradier API returned unexpected quote type: {type(quotes)}, value: {quotes}")
-                return []
 
-            quotes_list = quotes
-            logger.debug(f"Parsed quotes_list: {quotes_list}")
+            market_caps = {}
+            market_cap_tasks = [self._get_approximate_market_cap(symbol) for symbol in valid_symbols]
+            market_cap_results = await asyncio.gather(*market_cap_tasks, return_exceptions=True)
+            for symbol, market_cap in zip(valid_symbols, market_cap_results):
+                if isinstance(market_cap, Exception):
+                    logger.warning(f"Failed to fetch market cap for {symbol}: {str(market_cap)}")
+                    market_caps[symbol] = 0
+                else:
+                    market_caps[symbol] = market_cap / 1000
 
-            stock_data = []
-            for quote in quotes_list:
-                if not isinstance(quote, dict):
-                    logger.warning(f"Skipping invalid quote entry (not a dict): {quote}")
+            for quote in quotes:
+                symbol = quote.get("symbol", "").split('.')[0].upper()
+                if not symbol:
+                    logger.warning(f"Invalid quote entry (missing symbol): {quote}")
                     continue
-                raw_symbol = quote.get("symbol")
-                if not raw_symbol:
-                    logger.warning(f"Quote missing symbol: {quote}")
-                    continue
-                symbol = raw_symbol.split('.')[0].upper()
-                logger.debug(f"Raw symbol: {raw_symbol}, Normalized symbol: {symbol}")
-                market_cap = self._get_approximate_market_cap(symbol)
-                logger.debug(f"Market cap for {symbol}: {market_cap}")
-                stock_data.append((
-                    symbol,
-                    quote.get("last", 0),
-                    market_cap,
-                    quote.get("volume", 0),
-                    quote.get("change_percentage", 0.0),
-                    quote.get("bid", 0),
-                    quote.get("ask", 0)
-                ))
 
-            logger.debug(f"Returning stock_data: {stock_data}")
-            return stock_data
+                price = quote.get("last", 0) or quote.get("close", 0) or 0
+                prev_close = quote.get("prevclose", 0) or price or 0
+                change = (price - prev_close) if prev_close else 0
+                change_percentage = (change / prev_close * 100) if prev_close else 0
+                volume = quote.get("volume", 0) or 0
+                bid = quote.get("bid", 0) or 0
+                ask = quote.get("ask", 0) or 0
+                market_cap = market_caps.get(symbol, 0)
 
-        except Exception as e:
-            logger.error(f"Error in screen_stocks: {str(e)}")
+                results.append((symbol, price, change, volume, change_percentage, bid, ask, market_cap))
+        except aiohttp.ClientResponseError as http_err:
+            logger.error(f"HTTP Error fetching quotes for {valid_symbols_str} from Tradier: {str(http_err)}")
+            logger.error(f"Status Code: {http_err.status}")
+            logger.error(f"Response Text: {http_err.message}")
             return []
-        
-    def get_buy_sell_volume(self, symbols, bid_ask_data=None, force_refresh=False):
+        except tenacity.RetryError as retry_err:
+            logger.error(f"RetryError fetching quotes for {valid_symbols_str} from Tradier after all attempts: {str(retry_err)}")
+            if retry_err.last_attempt and retry_err.last_attempt.failed:
+                last_error = retry_err.last_attempt.exception()
+                logger.error(f"Last error: {str(last_error)}")
+                if isinstance(last_error, aiohttp.ClientResponseError):
+                    logger.error(f"Status Code: {last_error.status}")
+                    logger.error(f"Response Text: {last_error.message}")
+                else:
+                    logger.error("Last error is not a ClientResponseError.")
+            else:
+                logger.error("No last attempt information available.")
+            return []
+        except Exception as e:
+            logger.error(f"Error fetching quotes for {valid_symbols_str} from Tradier: {str(e)}", exc_info=True)
+            return []
+
+        logger.debug(f"Screened stocks: {results}")
+        return results
+
+    async def get_buy_sell_volume(self, symbols, bid_ask_data=None, force_refresh=False):
         if not symbols:
             return {}
 
-        # Validate symbols
         valid_symbols = [symbol for symbol in symbols if self._validate_symbol(symbol)]
         if not valid_symbols:
             logger.error("No valid symbols provided for buy/sell volume.")
@@ -257,72 +331,75 @@ class MarketData:
             invalid_symbols = set(symbols) - set(valid_symbols)
             logger.warning(f"Skipping invalid symbols for buy/sell volume: {invalid_symbols}")
 
-        # Initialize results
         results = {}
         current_time = time.time()
         valid_symbols_to_fetch = []
 
-        # Check cache for existing data (unless force_refresh is True)
         if not force_refresh:
             for symbol in valid_symbols:
                 if symbol in self.buy_sell_cache:
                     cached_data = self.buy_sell_cache[symbol]
                     if current_time - cached_data["timestamp"] < self.cache_ttl:
                         results[symbol] = (cached_data["buy_volume"], cached_data["sell_volume"])
-                        logger.debug(f"Using cached buy/sell volume for {symbol}: {results[symbol]} (age: {int(current_time - cached_data['timestamp'])} seconds)")
+                        logger.debug(f"Using cached buy/sell volume for {symbol}: {results[symbol]}")
                         continue
                 valid_symbols_to_fetch.append(symbol)
         else:
             logger.debug("Force refresh enabled; bypassing cache for all symbols")
             valid_symbols_to_fetch = valid_symbols
+            for symbol in valid_symbols:
+                self.buy_sell_cache.pop(symbol, None)
 
         if not valid_symbols_to_fetch:
             return results
 
-        # Use provided bid/ask data if available; otherwise, fetch it in a single batch
         if bid_ask_data is None:
             bid_ask_data = {}
             valid_symbols_str = ",".join(valid_symbols_to_fetch)
             logger.debug(f"Fetching bid/ask for symbols in a single batch: {valid_symbols_str}")
             try:
-                quote_response = self._make_api_request(
+                quote_data = await self._make_api_request(
                     f"{self.tradier_base_url}/markets/quotes",
                     params={"symbols": valid_symbols_str},
-                    use_alpaca=False  # Use Tradier for market data
+                    use_alpaca=False
                 )
-                quote_data = quote_response.json().get("quotes", {}).get("quote", {})
-                if isinstance(quote_data, dict):
-                    quote_data = [quote_data]
-                for quote in quote_data:
+                quotes = quote_data.get("quotes", {}).get("quote", {})
+                if isinstance(quotes, dict):
+                    quotes = [quotes]
+                for quote in quotes:
                     symbol = quote["symbol"].split('.')[0].upper()
-                    bid_ask_data[symbol] = (quote.get("bid", 0), quote.get("ask", 0))
+                    bid = quote.get("bid", 0)
+                    ask = quote.get("ask", 0)
+                    last_price = quote.get("last", 0) or quote.get("close", 0)
+                    if bid == 0 or ask == 0:
+                        bid = last_price * 0.995
+                        ask = last_price * 1.005
+                    bid_ask_data[symbol] = (bid, ask)
             except Exception as e:
                 logger.error(f"Error fetching bid/ask data for {valid_symbols_str}: {str(e)}")
                 for symbol in valid_symbols_to_fetch:
-                    bid_ask_data[symbol] = (0, 0)
+                    stock_data = await self.screen_stocks([symbol])
+                    last_price = stock_data[0][1] if stock_data else 0
+                    bid = last_price * 0.995
+                    ask = last_price * 1.005
+                    bid_ask_data[symbol] = (bid, ask)
 
-        # Fetch total volume as a fallback for all symbols
         total_volumes = {}
-        stock_data = self.screen_stocks(symbols=valid_symbols_to_fetch)
+        stock_data = await self.screen_stocks(symbols=valid_symbols_to_fetch)
         for stock in stock_data:
             symbol = stock[0]
             total_volume = stock[3]
             total_volumes[symbol] = total_volume
 
-        # Define the time range: last 4 hours, aligned with market hours
         current_time_dt = datetime.utcnow().replace(tzinfo=ZoneInfo("UTC"))
         current_time_eastern = current_time_dt.astimezone(self.market_calendar.timezone)
         current_date = current_time_eastern.date()
+        is_market_open = self.market_calendar.is_market_open(current_time_dt)
 
-        market_open_utc, market_close_utc = self.market_calendar.get_market_hours(
-            current_date,
-            market_open_hour=Config.MARKET_OPEN_HOUR,
-            market_open_minute=Config.MARKET_OPEN_MINUTE,
-            market_close_hour=Config.MARKET_CLOSE_HOUR,
-            market_close_minute=Config.MARKET_CLOSE_MINUTE
-        )
-
-        if current_time_dt < market_open_utc:
+        if is_market_open:
+            end_time = current_time_dt - timedelta(minutes=30)
+            start_time = end_time - timedelta(minutes=15)
+        else:
             previous_trading_day = self.market_calendar.get_previous_trading_day(current_date)
             market_open_utc, market_close_utc = self.market_calendar.get_market_hours(
                 previous_trading_day,
@@ -331,142 +408,137 @@ class MarketData:
                 market_close_hour=Config.MARKET_CLOSE_HOUR,
                 market_close_minute=Config.MARKET_CLOSE_MINUTE
             )
-            end_time = market_close_utc
-            start_time = end_time - timedelta(hours=4)
-        elif current_time_dt > market_close_utc:
-            if not self.market_calendar.is_trading_day(current_date):
-                previous_trading_day = self.market_calendar.get_previous_trading_day(current_date)
-                market_open_utc, market_close_utc = self.market_calendar.get_market_hours(
-                    previous_trading_day,
-                    market_open_hour=Config.MARKET_OPEN_HOUR,
-                    market_open_minute=Config.MARKET_OPEN_MINUTE,
-                    market_close_hour=Config.MARKET_CLOSE_HOUR,
-                    market_close_minute=Config.MARKET_CLOSE_MINUTE
-                )
-            end_time = market_close_utc
-            start_time = end_time - timedelta(hours=4)
-        else:
-            if not self.market_calendar.is_trading_day(current_date):
-                previous_trading_day = self.market_calendar.get_previous_trading_day(current_date)
-                market_open_utc, market_close_utc = self.market_calendar.get_market_hours(
-                    previous_trading_day,
-                    market_open_hour=Config.MARKET_OPEN_HOUR,
-                    market_open_minute=Config.MARKET_OPEN_MINUTE,
-                    market_close_hour=Config.MARKET_CLOSE_HOUR,
-                    market_close_minute=Config.MARKET_CLOSE_MINUTE
-                )
-                end_time = market_close_utc
-                start_time = end_time - timedelta(hours=4)
-            else:
-                end_time = current_time_dt
-                start_time = end_time - timedelta(hours=4)
-                if start_time < market_open_utc:
-                    start_time = market_open_utc
+            end_time = market_close_utc - timedelta(minutes=1)
+            start_time = end_time - timedelta(minutes=15)
 
-        if end_time > current_time_dt:
-            logger.warning(f"End time {end_time} is in the future; adjusting to current time {current_time_dt}")
-            end_time = current_time_dt
-            start_time = end_time - timedelta(hours=4)
-            if start_time < market_open_utc:
-                start_time = market_open_utc
-
-        if start_time >= end_time:
-            logger.warning(f"Invalid time range: start_time {start_time} is not before end_time {end_time}. Adjusting to previous trading day.")
-            previous_trading_day = self.market_calendar.get_previous_trading_day(end_time.date())
-            market_open_utc, market_close_utc = self.market_calendar.get_market_hours(
-                previous_trading_day,
-                market_open_hour=Config.MARKET_OPEN_HOUR,
-                market_open_minute=Config.MARKET_OPEN_MINUTE,
-                market_close_hour=Config.MARKET_CLOSE_HOUR,
-                market_close_minute=Config.MARKET_CLOSE_MINUTE
-            )
-            end_time = market_close_utc
-            start_time = end_time - timedelta(hours=4)
-
-        # Format timestamps for Tradier (YYYY-MM-DD HH:MM:SS)
-        start_ts = start_time.strftime("%Y-%m-%d %H:%M:%S")
-        end_ts = end_time.strftime("%Y-%m-%d %H:%M:%S")
+        start_ts = start_time.isoformat()
+        end_ts = end_time.isoformat()
         logger.debug(f"Time range for buy/sell volume: start={start_ts}, end={end_ts}")
 
-        # Fetch trade data using Tradier
-        trades_by_symbol = defaultdict(list)
+        price_trends = {}
         for symbol in valid_symbols_to_fetch:
-            logger.debug(f"Fetching timesales for {symbol} from Tradier API")
             try:
-                timesales_response = self._make_api_request(
-                    f"{self.tradier_base_url}/markets/timesales",
-                    params={
-                        "symbol": symbol,
-                        "interval": "tick",
-                        "start": start_ts,
-                        "end": end_ts
-                    },
-                    use_alpaca=False  # Use Tradier for market data
+                history_data = await self.get_price_history(
+                    symbol,
+                    period_type="day",
+                    period="1",
+                    frequency_type="minute",
+                    frequency=5
                 )
-                raw_response = timesales_response.text
-                logger.debug(f"Raw timesales response for {symbol}: {raw_response}")
-                timesales_data = timesales_response.json()
-                if timesales_data is None:
-                    logger.error(f"Failed to parse JSON response for {symbol}; response is None")
-                    raise ValueError("Timesales response is not valid JSON")
-                series = timesales_data.get("series")
-                if series is None:
-                    logger.warning(f"No trade data available for {symbol} in the specified time range (series is null). Falling back to even split.")
-                    total_volume = total_volumes.get(symbol, 0)
-                    buy_volume = total_volume // 2 if total_volume is not None else 0
-                    sell_volume = total_volume - buy_volume if total_volume is not None else 0
-                    results[symbol] = (buy_volume, sell_volume)
-                    self.buy_sell_cache[symbol] = {
-                        "buy_volume": buy_volume,
-                        "sell_volume": sell_volume,
-                        "timestamp": current_time
-                    }
-                    continue
-                trades = series.get("data", [])
-                trades_by_symbol[symbol] = trades
-            except requests.exceptions.HTTPError as http_err:
-                error_message = str(http_err)
-                if "502" in error_message:
-                    logger.warning(f"Tradier API returned a 502 Bad Gateway error for {symbol}. Falling back to even split.")
-                elif "401" in error_message or "403" in error_message:
-                    logger.warning(f"Cannot fetch buy/sell volume for {symbol}: Unauthorized. Check your Tradier API key or subscription.")
-                elif "400" in error_message:
-                    logger.error(f"Bad Request error fetching buy/sell volume for {symbol} from Tradier: {error_message}")
-                    logger.error(f"Response Text: {http_err.response.text if http_err.response else 'No response'}")
-                elif "429" in error_message:
-                    logger.error(f"Rate limit exceeded for Tradier API for {symbol}. Falling back to even split.")
+                if history_data and "candles" in history_data:
+                    candles = history_data["candles"][-12:]
+                    if len(candles) >= 2:
+                        prices = [candle["close"] for candle in candles]
+                        sma_short = sum(prices[-3:]) / 3
+                        sma_long = sum(prices[:3]) / 3
+                        trend = 1 if sma_short > sma_long else -1 if sma_short < sma_long else 0
+                        price_trends[symbol] = trend
+                    else:
+                        price_trends[symbol] = 0
                 else:
-                    logger.error(f"HTTP Error fetching buy/sell volume for {symbol} from Tradier: {error_message}")
-                    logger.error(f"Response Text: {http_err.response.text if http_err.response else 'No response'}")
-                total_volume = total_volumes.get(symbol, 0)
-                buy_volume = total_volume // 2 if total_volume is not None else 0
-                sell_volume = total_volume - buy_volume if total_volume is not None else 0
-                results[symbol] = (buy_volume, sell_volume)
-                self.buy_sell_cache[symbol] = {
-                    "buy_volume": buy_volume,
-                    "sell_volume": sell_volume,
-                    "timestamp": current_time
-                }
+                    price_trends[symbol] = 0
             except Exception as e:
-                logger.error(f"Error fetching buy/sell volume for {symbol} from Tradier: {str(e)}")
-                total_volume = total_volumes.get(symbol, 0)
-                buy_volume = total_volume // 2 if total_volume is not None else 0
-                sell_volume = total_volume - buy_volume if total_volume is not None else 0
-                results[symbol] = (buy_volume, sell_volume)
-                self.buy_sell_cache[symbol] = {
-                    "buy_volume": buy_volume,
-                    "sell_volume": sell_volume,
-                    "timestamp": current_time
-                }
+                logger.error(f"Error fetching price history for trend analysis of {symbol}: {str(e)}")
+                price_trends[symbol] = 0
 
-        # Process trades for symbols that were successfully fetched
-        for symbol, trades in trades_by_symbol.items():
+        trades_by_symbol = defaultdict(list)
+        if valid_symbols_to_fetch:
+            async def fetch_timesales(symbol):
+                logger.debug(f"Fetching timesales for {symbol} from Alpaca API")
+                params = {
+                    "symbols": symbol,
+                    "timeframe": "1Min",
+                    "start": start_ts,
+                    "end": end_ts
+                }
+                logger.debug(f"Alpaca timesales request parameters for {symbol}: {params}")
+                try:
+                    alpaca_url = f"{self.alpaca_base_url.rstrip('/')}/v2/stocks/bars"
+                    data = await self._make_api_request(
+                        alpaca_url,
+                        params=params,
+                        use_alpaca=True
+                    )
+                    logger.debug(f"Alpaca API Response for {symbol}: {data}")
+                    # Handle both possible structures: bars as a list or bars as a dict with symbol keys
+                    bars_data = data.get("bars", [])
+                    if isinstance(bars_data, dict):
+                        bars = bars_data.get(symbol, [])
+                    else:
+                        bars = bars_data
+                    if not bars or not isinstance(bars, list) or not all(isinstance(bar, dict) for bar in bars):
+                        logger.warning(f"No valid trade data available for {symbol} from Alpaca. Response: {data}")
+                        return symbol, []
+                    trades = [
+                        {
+                            "price": bar["c"],
+                            "volume": bar["v"],
+                            "time": bar["t"]
+                        }
+                        for bar in bars
+                    ]
+                    return symbol, trades
+                except Exception as e:
+                    logger.error(f"Error fetching timesales for {symbol} from Alpaca: {str(e)}")
+                    return symbol, []
+
+            timesales_results = await asyncio.gather(
+                *[fetch_timesales(symbol) for symbol in valid_symbols_to_fetch],
+                return_exceptions=True
+            )
+
+            for result in timesales_results:
+                if isinstance(result, tuple):
+                    symbol, trades = result
+                    if trades:
+                        trades_by_symbol[symbol] = trades
+                    else:
+                        logger.warning(f"No trade data available for {symbol}. Falling back to trend-based split.")
+                        total_volume = total_volumes.get(symbol, 0)
+                        trend = price_trends.get(symbol, 0)
+                        if trend > 0:
+                            buy_volume = int(total_volume * 0.6)
+                            sell_volume = total_volume - buy_volume
+                        elif trend < 0:
+                            buy_volume = int(total_volume * 0.4)
+                            sell_volume = total_volume - buy_volume
+                        else:
+                            buy_volume = total_volume // 2
+                            sell_volume = total_volume - buy_volume
+                        results[symbol] = (buy_volume, sell_volume)
+                        self.buy_sell_cache[symbol] = {
+                            "buy_volume": buy_volume,
+                            "sell_volume": sell_volume,
+                            "timestamp": current_time
+                        }
+                else:
+                    logger.error(f"Unexpected result from timesales fetch: {result}")
+
+        try:
+            sentiment_scores = await self.stock_sentiment.get_stock_sentiment_batch(valid_symbols_to_fetch)
+        except Exception as e:
+            logger.error(f"Error fetching sentiment for symbols: {str(e)}")
+            if isinstance(e, AttributeError):
+                logger.error("StockSentiment does not have get_stock_sentiment_batch method.")
+            sentiment_scores = {symbol: 0 for symbol in valid_symbols_to_fetch}
+
+        for symbol in valid_symbols_to_fetch:
+            trades = trades_by_symbol.get(symbol, [])
             bid, ask = bid_ask_data.get(symbol, (0, 0))
+            trend = price_trends.get(symbol, 0)
+
             if bid == 0 or ask == 0:
-                logger.warning(f"No valid bid/ask data for {symbol}. Falling back to even split.")
+                logger.warning(f"No valid bid/ask data for {symbol}. Using trend-based split.")
                 total_volume = total_volumes.get(symbol, 0)
-                buy_volume = total_volume // 2 if total_volume is not None else 0
-                sell_volume = total_volume - buy_volume if total_volume is not None else 0
+                if trend > 0:
+                    buy_volume = int(total_volume * 0.6)
+                    sell_volume = total_volume - buy_volume
+                elif trend < 0:
+                    buy_volume = int(total_volume * 0.4)
+                    sell_volume = total_volume - buy_volume
+                else:
+                    buy_volume = total_volume // 2
+                    sell_volume = total_volume - buy_volume
                 results[symbol] = (buy_volume, sell_volume)
                 self.buy_sell_cache[symbol] = {
                     "buy_volume": buy_volume,
@@ -476,10 +548,17 @@ class MarketData:
                 continue
 
             if not trades:
-                logger.warning(f"No trade data available for {symbol} in the specified time range. Falling back to even split.")
+                logger.warning(f"No trade data available for {symbol}. Using trend-based split.")
                 total_volume = total_volumes.get(symbol, 0)
-                buy_volume = total_volume // 2 if total_volume is not None else 0
-                sell_volume = total_volume - buy_volume if total_volume is not None else 0
+                if trend > 0:
+                    buy_volume = int(total_volume * 0.6)
+                    sell_volume = total_volume - buy_volume
+                elif trend < 0:
+                    buy_volume = int(total_volume * 0.4)
+                    sell_volume = total_volume - buy_volume
+                else:
+                    buy_volume = total_volume // 2
+                    sell_volume = total_volume - buy_volume
                 results[symbol] = (buy_volume, sell_volume)
                 self.buy_sell_cache[symbol] = {
                     "buy_volume": buy_volume,
@@ -488,14 +567,12 @@ class MarketData:
                 }
                 continue
 
-            # Get sentiment score using StockSentiment
-            sentiment_score = self.stock_sentiment.get_stock_sentiment(symbol)
-
+            sentiment_score = sentiment_scores.get(symbol, 0)
             buy_volume = 0
             sell_volume = 0
             recent_buys = 0
             recent_sells = 0
-            momentum_window = 5
+            momentum_window = 20
 
             for i, trade in enumerate(trades):
                 trade_price = trade.get("price", 0)
@@ -512,13 +589,11 @@ class MarketData:
                         recent_buys = sum(1 for j in range(i - momentum_window, i) if trades[j]["price"] >= ask)
                         recent_sells = sum(1 for j in range(i - momentum_window, i) if trades[j]["price"] <= bid)
                     total_recent = recent_buys + recent_sells
-                    if total_recent > 0:
-                        momentum_buy_ratio = recent_buys / total_recent
-                    else:
-                        momentum_buy_ratio = 0.5
+                    momentum_buy_ratio = recent_buys / total_recent if total_recent > 0 else 0.5
 
+                    trend_adjustment = 0.6 if trend > 0 else 0.4 if trend < 0 else 0.5
                     sentiment_adjustment = (sentiment_score + 1) / 2
-                    buy_ratio = (momentum_buy_ratio + sentiment_adjustment) / 2
+                    buy_ratio = (0.5 * momentum_buy_ratio + 0.3 * trend_adjustment + 0.2 * sentiment_adjustment)
                     buy_ratio = max(0, min(1, buy_ratio))
                     sell_ratio = 1 - buy_ratio
 
@@ -542,16 +617,20 @@ class MarketData:
 
         return results
 
-    def _get_approximate_market_cap(self, symbol):
-        """Fetch market cap (in millions) using yfinance."""
+    async def _get_approximate_market_cap(self, symbol):
         try:
             logger.debug(f"Fetching market cap for {symbol} using yfinance")
+            loop = asyncio.get_running_loop()
             ticker = yf.Ticker(symbol)
-            info = ticker.info
+            info = await loop.run_in_executor(None, lambda: ticker.info)
             market_cap = info.get("marketCap", 0)
             market_cap_millions = market_cap / 1e6
-            logger.debug(f"Market cap for {symbol}: {market_cap_millions} million USD")
             return market_cap_millions
         except Exception as e:
             logger.error(f"Error fetching market cap for {symbol} using yfinance: {str(e)}")
             return 0
+
+    logger.setLevel(logging.DEBUG)
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] [%(threadName)s] %(name)s: %(message)s"))
+    logger.addHandler(handler)

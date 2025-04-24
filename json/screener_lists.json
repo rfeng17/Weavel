@@ -1,0 +1,38 @@
+[
+    {
+        "name": "Tech",
+        "symbols": [
+            "AAPL",
+            "MSFT",
+            "GOOGL",
+            "QQQ",
+            "PLTR"
+        ],
+        "display_order": [
+            "MSFT",
+            "GOOGL",
+            "AAPL",
+            "QQQ",
+            "PLTR"
+        ]
+    },
+    {
+        "name": "Semis",
+        "symbols": [
+            "SOXL",
+            "MU",
+            "NVDA",
+            "AMD",
+            "AVGO",
+            "QCOM"
+        ],
+        "display_order": [
+            "NVDA",
+            "AVGO",
+            "QCOM",
+            "AMD",
+            "MU",
+            "SOXL"
+        ]
+    }
+]

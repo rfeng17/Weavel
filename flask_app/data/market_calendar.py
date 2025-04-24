@@ -46,3 +46,34 @@ class MarketCalendar:
         market_open_utc = market_open_eastern.astimezone(ZoneInfo("UTC"))
         market_close_utc = market_close_eastern.astimezone(ZoneInfo("UTC"))
         return market_open_utc, market_close_utc
+
+    def is_market_open(self, current_time):
+        """
+        Check if the market is open at the given time.
+        Args:
+            current_time: datetime object with timezone (preferably in UTC)
+        Returns:
+            bool: True if the market is open, False otherwise
+        """
+        # Convert current time to Eastern Time
+        current_time_eastern = current_time.astimezone(self.timezone)
+        current_date = current_time_eastern.date()
+
+        # Check if today is a trading day
+        if not self.is_trading_day(current_date):
+            return False
+
+        # Get market hours for today
+        market_open, market_close = self.get_market_hours(
+            current_date,
+            market_open_hour=9,
+            market_open_minute=30,
+            market_close_hour=16,
+            market_close_minute=0
+        )
+
+        # Convert current time to UTC for comparison
+        current_time_utc = current_time.astimezone(ZoneInfo("UTC"))
+
+        # Check if current time is within market hours
+        return market_open <= current_time_utc <= market_close
