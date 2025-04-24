@@ -8,3 +8,10 @@ schwab-py
 holidays
 tenacity
 vaderSentiment
+alpaca-py
+aiohttp
+cachetools
+gunicorn
+gevent
+psutil
+waitress

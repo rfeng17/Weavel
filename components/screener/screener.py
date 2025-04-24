@@ -1,378 +1,344 @@
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox, QPushButton, QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar, QInputDialog, QMessageBox
-from PySide6.QtCore import Qt, QTimer, Signal, Slot, QObject
-from PySide6.QtGui import QColor
+from PySide6.QtWidgets import (
+    QWidget, 
+    QVBoxLayout, 
+    QHBoxLayout, 
+    QLabel, 
+    QStyledItemDelegate, 
+    QPushButton, 
+    QTableWidgetItem, 
+    QHeaderView, 
+    QProgressBar, 
+    QInputDialog, 
+    QMessageBox, 
+    QScrollArea
+)
+from PySide6.QtCore import Qt, QThread, Signal, Slot, QTimer, QRect
+from PySide6.QtGui import QIcon, QPen, QColor
+
+import json
+import os
 import logging
 import requests
 import threading
+import time
+from datetime import datetime, timedelta
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 from flask_app.config import Config
 from components.screener.table_edit import TableEdit, CustomTableWidget
-import json
-import os
 
 logger = logging.getLogger(__name__)
 
-class StockUpdater(QObject):
-    """Class to handle asynchronous stock updates and emit signals for UI updates."""
-    update_ui_signal = Signal()
-
-    def __init__(self, server_address, parent=None):
+class UpDownDelegate(QStyledItemDelegate):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.server_address = server_address
+        self.max_combined_volume = 1
+
+    def set_max_combined_volume(self, max_volume):
+        self.max_combined_volume = max(1, max_volume)
+
+    def paint(self, painter, option, index):
+        up_volume = index.data(Qt.UserRole) or 0
+        down_volume = index.data(Qt.UserRole + 1) or 0
+
+        painter.fillRect(option.rect, QColor("#2E3440"))
+
+        rect = option.rect.adjusted(5, 5, -5, -5)
+        total_width = rect.width()
+        center_x = rect.center().x()
+        height = rect.height()
+
+        max_length = total_width / 2
+        up_length = (up_volume / self.max_combined_volume) * max_length
+        down_length = (down_volume / self.max_combined_volume) * max_length
+
+        painter.setPen(QPen(Qt.black, 1))
+        painter.drawLine(center_x, rect.top(), center_x, rect.bottom())
+
+        if up_volume > 0:
+            painter.setPen(QPen(Qt.NoPen))
+            painter.setBrush(QColor(Qt.green))
+            up_rect = QRect(
+                center_x, rect.top(),
+                int(up_length), height
+            )
+            painter.drawRect(up_rect)
+
+        if down_volume > 0:
+            painter.setPen(QPen(Qt.NoPen))
+            painter.setBrush(QColor(Qt.red))
+            down_rect = QRect(
+                center_x - int(down_length), rect.top(),
+                int(down_length), height
+            )
+            painter.drawRect(down_rect)
+
+    def sizeHint(self, option, index):
+        return option.rect.size()
+
+class ScreenerList:
+    def __init__(self, name, symbols=None, display_order=None):
+        self.name = name
+        self.symbols = symbols if symbols is not None else []
+        self.display_order = display_order if display_order is not None else []  # New attribute for display order
         self.filtered_stocks = []
-        self.lock = threading.Lock()
-        self.symbols = []
+        self.sort_column = -1
+        self.sort_order = Qt.AscendingOrder
+        self.table = None
+        self.table_edit = None
+        self.loading_bar = None
+        self.container_layout = None
+        self.updater = None
 
-    def start_update(self, filtered_stocks, symbols):
-        if not symbols:
-            logger.debug("No stocks to update price and volume for.")
-            return
+class StockUpdater(QThread):
+    update_data = Signal(ScreenerList, list)
+    set_loading_signal = Signal(ScreenerList, bool)
 
-        with self.lock:
-            self.filtered_stocks = filtered_stocks.copy()
-            self.symbols = symbols.copy()  # Store symbols for use in update_price_and_volume
-
-        thread = threading.Thread(target=self.update_price_and_volume)
-        thread.daemon = True
-        thread.start()
-
-    def update_price_and_volume(self):
-        try:
-            with self.lock:
-                symbols = self.symbols  # Use the stored symbols
-            logger.debug(f"Fetching updated quotes for symbols: {symbols}")
-
-            response = requests.post(
-                f"{self.server_address}/api/update_quotes",
-                json={"symbols": symbols},
-                timeout=5
-            )
-            response.raise_for_status()
-            quote_data = response.json()
-            logger.debug(f"Backend Response: {quote_data}")
-
-            if "error" in quote_data:
-                logger.error(f"Error from backend: {quote_data['error']}")
-                return
-
-            has_changes = False
-            with self.lock:
-                for i, stock in enumerate(self.filtered_stocks):
-                    symbol = stock[0]
-                    if symbol in quote_data:
-                        new_price = quote_data[symbol]["price"]
-                        new_volume = quote_data[symbol]["volume"]
-                        new_change = quote_data[symbol]["change_percentage"]
-                        new_volume_bought = quote_data[symbol].get("volume_bought", stock[5])
-                        new_volume_sold = quote_data[symbol].get("volume_sold", stock[6])
-                        if (stock[1] != new_price or
-                            stock[3] != new_volume or
-                            stock[4] != new_change or
-                            stock[5] != new_volume_bought or
-                            stock[6] != new_volume_sold):
-                            has_changes = True
-                            self.filtered_stocks[i] = (
-                                symbol,
-                                new_price,
-                                stock[2],  # market_cap
-                                new_volume,
-                                new_change,
-                                new_volume_bought,
-                                new_volume_sold
-                            )
-                            if i == 0:
-                                logger.debug(f"Updated {symbol}: Price={new_price}, "
-                                             f"Volume={new_volume}, Change={new_change}, "
-                                             f"Volume Bought={new_volume_bought}, Volume Sold={new_volume_sold}")
-
-            if has_changes:
-                self.update_ui_signal.emit()
-
-        except requests.exceptions.Timeout:
-            logger.error("Request to backend timed out while fetching updated quotes.")
-        except requests.exceptions.HTTPError as http_err:
-            logger.error(f"HTTP Error fetching quotes from backend: {str(http_err)}")
-            logger.error(f"Response Text: {http_err.response.text if http_err.response else 'No response'}")
-        except Exception as e:
-            logger.error(f"Error updating price and volume: {str(e)}")
-        finally:
-            self.update_ui_signal.emit()
-            
-    def get_filtered_stocks(self):
-        with self.lock:
-            return self.filtered_stocks.copy()
-
-class StockAdder(QObject):
-    """Class to handle asynchronous stock addition and emit signals for UI updates."""
-    add_stock_signal = Signal(list)  # Emits the filtered stocks
-    error_signal = Signal(str)  # Emits an error message if the operation fails
-
-    def __init__(self, server_address, parent=None):
+    def __init__(self, parent, screener_list):
         super().__init__(parent)
-        self.server_address = server_address
-        self.lock = threading.Lock()
+        self.parent = parent
+        self.screener_list = screener_list
+        self.running = True
+        # Set up a session with retries
+        self.session = requests.Session()
+        retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+        self.session.mount("http://", HTTPAdapter(max_retries=retries))
 
-    def add_stock(self, new_symbol, all_symbols, filters):
-        """Add a new stock and fetch its data in a separate thread."""
-        self.new_symbol = new_symbol  # Store the new symbol for use in _fetch_and_filter_stocks
-        self.all_symbols = all_symbols  # Store all symbols for validation
-        thread = threading.Thread(target=self._fetch_and_filter_stocks)
-        thread.daemon = True
-        thread.start()
+    def run(self):
+        while self.running:
+            if not self.screener_list.symbols:
+                time.sleep(1)
+                continue
 
-    def _fetch_and_filter_stocks(self):
-        """Fetch data for the new stock from the backend."""
+            try:
+                self.set_loading_signal.emit(self.screener_list, True)
+                response = self.session.post(
+                    "http://127.0.0.1:5000/api/update_quotes",
+                    json={"symbols": self.screener_list.symbols, "force_refresh": False},
+                    timeout=30  # Increased timeout to 30 seconds
+                )
+                response.raise_for_status()
+                updated_data = response.json()
+
+                new_filtered_stocks = []
+                with self.parent.lock:
+                    for symbol in self.screener_list.symbols:
+                        if symbol in updated_data:
+                            data = updated_data[symbol]
+                            new_filtered_stocks.append((
+                                symbol,
+                                data["price"],
+                                data["change_percentage"],
+                                data.get("market_cap", 0),
+                                data["volume"],
+                                data["volume_bought"],
+                                data["volume_sold"]
+                            ))
+                    self.screener_list.filtered_stocks = new_filtered_stocks.copy()
+
+                self.update_data.emit(self.screener_list, new_filtered_stocks)
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Error in StockUpdater for list {self.screener_list.name}: {str(e)}")
+                logger.debug(f"Symbols: {self.screener_list.symbols}")
+            finally:
+                self.set_loading_signal.emit(self.screener_list, False)
+                time.sleep(15)
+
+class StockAdder(QThread):
+    add_stock_finished = Signal(ScreenerList, tuple)
+    set_loading_signal = Signal(ScreenerList, bool)
+
+    def __init__(self, parent, screener_list, symbol):
+        super().__init__(parent)
+        self.parent = parent
+        self.screener_list = screener_list
+        self.symbol = symbol
+        # Set up a session with retries
+        self.session = requests.Session()
+        retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+        self.session.mount("http://", HTTPAdapter(max_retries=retries))
+
+    def run(self):
         try:
-            # Request data for only the new stock
-            request_data = {
-                "symbols": [self.new_symbol]
-            }
-            logger.debug(f"Sending request to backend for new stock {self.new_symbol}: {request_data}")
-            response = requests.post(
-                f"{self.server_address}/api/screen",
-                json=request_data
+            self.set_loading_signal.emit(self.screener_list, True)
+            response = self.session.post(
+                "http://127.0.0.1:5000/api/screen",
+                json={"symbols": [self.symbol]},
+                timeout=30  # Increased timeout to 30 seconds
             )
             response.raise_for_status()
-            stocks = response.json()
-            logger.debug(f"Received response from backend for {self.new_symbol}: {stocks}")
+            stock_data = response.json()
 
-            # Process the response
-            if not stocks:
-                self.error_signal.emit(f"Ticker not found: {self.new_symbol}")
-                return
+            if stock_data and isinstance(stock_data, list) and len(stock_data) > 0:
+                stock = stock_data[0]
+                stock_tuple = (
+                    stock["symbol"],          # Symbol
+                    stock["price"],           # Price
+                    stock["change_percentage"],  # Change percentage
+                    stock["change"],          # Change
+                    stock["volume"],          # Volume
+                    stock["bid"],             # Bid
+                    stock["ask"]              # Ask
+                )
+                self.add_stock_finished.emit(self.screener_list, stock_tuple)
+            else:
+                logger.warning(f"No data returned for symbol: {self.symbol}")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error adding stock {self.symbol} to list {self.screener_list.name}: {str(e)}")
+        except KeyError as e:
+            logger.error(f"Unexpected response format from /api/screen for symbol {self.symbol}: {stock_data}")
+            logger.error(f"KeyError: {str(e)}")
+        finally:
+            self.set_loading_signal.emit(self.screener_list, False)
+            
+class StartUpdateWorker(QThread):
+    update_finished = Signal(ScreenerList, list)
+    set_loading_signal = Signal(ScreenerList, bool)
 
-            stock = stocks[0]  # Expecting data for only one stock
-            symbol = stock[0]
-            change_percentage = stock[4]
-            if change_percentage is None:
-                logger.warning(f"Stock {symbol}: change percentage is None")
-                self.error_signal.emit(f"Ticker not found: {self.new_symbol}")
-                return
+    def __init__(self, parent, screener_list, symbols):
+        super().__init__(parent)
+        self.parent = parent
+        self.screener_list = screener_list
+        self.symbols = symbols
+        # Set up a session with retries
+        self.session = requests.Session()
+        retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+        self.session.mount("http://", HTTPAdapter(max_retries=retries))
 
-            # Ensure the stock tuple includes volume_bought and volume_sold
-            if len(stock) < 7:  # Expecting 7 fields: symbol, price, market_cap, volume, change, volume_bought, volume_sold
-                stock = tuple(stock) + (0, 0)  # Add default values if not provided
-            self.add_stock_signal.emit(stock)
-
-        except requests.exceptions.HTTPError as http_err:
-            logger.error(f"HTTP Error fetching stock data for {self.new_symbol}: {str(http_err)}")
-            self.error_signal.emit(f"HTTP Error: {str(http_err)}")
-        except Exception as e:
-            logger.error(f"Error adding stock {self.new_symbol}: {str(e)}")
-            self.error_signal.emit(str(e))
+    def run(self):
+        try:
+            self.set_loading_signal.emit(self.screener_list, True)
+            response = self.session.post(
+                "http://127.0.0.1:5000/api/screen",
+                json={"symbols": self.symbols},
+                timeout=30  # Increased timeout to 30 seconds
+            )
+            response.raise_for_status()
+            stock_data = response.json()
+            filtered_stocks = [
+                (
+                    stock["symbol"],          # Symbol
+                    stock["price"],           # Price
+                    stock["change_percentage"],  # Change percentage
+                    stock["change"],          # Change
+                    stock["volume"],          # Volume
+                    stock["bid"],             # Bid
+                    stock["ask"]              # Ask
+                )
+                for stock in stock_data
+            ]
+            self.update_finished.emit(self.screener_list, filtered_stocks)
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error in StartUpdateWorker for list {self.screener_list.name}: {str(e)}")
+            logger.debug(f"Symbols: {self.symbols}")
+        except KeyError as e:
+            logger.error(f"Unexpected response format from /api/screen: {stock_data}")
+            logger.error(f"KeyError: {str(e)}")
+        finally:
+            self.set_loading_signal.emit(self.screener_list, False)
 
 class StockScreener(QWidget):
     def __init__(self):
         super().__init__()
-        self.server_address = Config.FLASK_SERVER_ADDRESS
-        
-        self.stocks_file = "json/stocks.json"
-        default_symbols = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "NVDA", "JPM", "BAC", "WMT", "KO"]
-        if os.path.exists(self.stocks_file):
-            try:
-                with open(self.stocks_file, 'r') as f:
-                    data = json.load(f)
-                    self.symbols = data.get("symbols", default_symbols)
-            except (json.JSONDecodeError, KeyError) as e:
-                logger.error(f"Error reading stocks.json: {str(e)}. Using default symbols.")
-                self.symbols = default_symbols
-                self._save_symbols()
-        else:
-            logger.info("stocks.json not found. Creating with default symbols.")
-            self.symbols = default_symbols
-            self._save_symbols()
-        self.filtered_stocks = []
-        self.sort_column = -1
-        self.sort_order = Qt.AscendingOrder
-        self.lock = threading.Lock()  # Lock for synchronizing access to symbols and filtered_stocks
-        self.is_adding_stock = False  # Flag to prevent concurrent stock additions
-        
-        self.setStyleSheet("""
-            QWidget {
-                background-color: #3B4252;
-                border-radius: 15px;
-                padding: 15px;
-            }
-            QLabel {
-                color: #D8DEE9;
-                font-size: 16px;
-                font-weight: bold;
-            }
-            QLineEdit {
-                background-color: #2E3440;
-                color: #D8DEE9;
-                border: 1px solid #4C566A;
-                border-radius: 8px;
-                padding: 8px;
-                font-size: 14px;
-            }
-            QLineEdit:focus {
-                border: 1px solid #81A1C1;
-            }
-            QComboBox {
-                background-color: #2E3440;
-                color: #D8DEE9;
-                border: 1px solid #4C566A;
-                border-radius: 8px;
-                padding: 8px;
-                font-size: 14px;
-            }
-            QComboBox::drop-down {
-                border: none;
-            }
-            QComboBox::down-arrow {
-                image: url(down_arrow.png);
-                width: 12px;
-                height: 12px;
-            }
-            QComboBox QAbstractItemView {
-                background-color: #2E3440;
-                color: #D8DEE9;
-                selection-background-color: #4C566A;
-                border: 1px solid #4C566A;
-                border-radius: 8px;
-            }
-            QPushButton {
-                background-color: #5E81AC;
-                color: #ECEFF4;
-                padding: 10px;
-                border-radius: 10px;
-                font-size: 16px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #81A1C1;
-            }
-            QPushButton:pressed {
-                background-color: #4C566A;
-            }
-            QPushButton#AddStockButton {
-                background-color: #5E81AC;
-                color: #ECEFF4;
-                padding: 5px;
-                border-radius: 5px;
-                font-size: 14px;
-                font-weight: bold;
-                min-width: 30px;
-                min-height: 30px;
-            }
-            QPushButton#AddStockButton:hover {
-                background-color: #81A1C1;
-            }
-            QPushButton#AddStockButton:pressed {
-                background-color: #4C566A;
-            }
-            QTableWidget {
-                background-color: #2E3440;
-                color: #D8DEE9;
-                border: 1px solid #4C566A;
-                border-radius: 10px;
-                font-size: 14px;
-            }
-            QTableWidget::item {
-                padding: 8px;
-                border: none;
-            }
-            QTableWidget::item:selected {
-                background-color: #4C566A;
-                color: #ECEFF4;
-            }
-            QTableWidget QHeaderView::section {
-                background-color: #4C566A;
-                color: #ECEFF4;
-                padding: 8px;
-                border: 1px solid #5E81AC;
-                font-size: 14px;
-                font-weight: bold;
-                height: 48px;
-            }
-            QTableWidget QHeaderView::section:hover {
-                background-color: #5E81AC;
-            }
-            QTableWidget QHeaderView::section:vertical {
-                background-color: transparent;
-                color: transparent;
-            }
-            QTableWidget QTableCornerButton::section {
-                background-color: #2E3440;
-                border: 1px solid #4C566A;
-            }
-            QProgressBar {
-                background-color: #2E3440;
-                border: 1px solid #4C566A;
-                border-radius: 2px;
-                text-align: center;
-                color: #D8DEE9;
-                font-size: 10px;
-                height: 5px;
-            }
-            QProgressBar::chunk {
-                background-color: #81A1C1;
-                border-radius: 1px;
-            }
-        """)
+        self.screener_lists = []
+        self.lock = threading.Lock()
+        self.update_timers = {}
+        self.pending_updates = {}
         self.setup_ui()
-        self.screen_stocks()
-        self.stock_updater = StockUpdater(self.server_address, parent=self)
-        self.stock_adder = StockAdder(self.server_address, parent=self)
-        self.update_timer = QTimer(self)
-        self.update_timer.timeout.connect(lambda: self.start_update())  # Ensure correct binding
-        self.update_timer.start(15000)
-        self.stock_updater.update_ui_signal.connect(self.handle_update)
-        self.stock_adder.add_stock_signal.connect(self.handle_add_stock)
-        self.stock_adder.error_signal.connect(self.handle_add_stock_error)
-        # Set up the context menu for the table
-        self.table_edit = TableEdit(self.results_table, self)
+        self._load_screener_lists()
 
     def setup_ui(self):
-        """Set up the UI components for the stock screener."""
         layout = QVBoxLayout(self)
         layout.setContentsMargins(15, 15, 15, 15)
         layout.setSpacing(15)
 
-        header_LabeL = QLabel("Stock Screener")
-        header_LabeL.setStyleSheet("font-size: 24px; color: #ECEFF4; font-weight: bold;")
-        header_LabeL.setAlignment(Qt.AlignCenter)
-        layout.addWidget(header_LabeL)
+        header_label = QLabel("Stock Screener")
+        header_label.setStyleSheet("font-size: 24px; color: #ECEFF4; font-weight: bold;")
+        header_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(header_label)
 
-        # Table and Add Stock Button Layout
-        table_container = QVBoxLayout()
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
-        # Results Table
-        self.results_table = CustomTableWidget()
-        self.results_table.setColumnCount(7)  # Increased from 5 to 7 for new columns
-        self.results_table.setHorizontalHeaderLabels([
+        scroll_widget = QWidget()
+        self.tables_container = QVBoxLayout(scroll_widget)
+        self.tables_container.setAlignment(Qt.AlignTop)
+        self.tables_container.setSpacing(15)
+
+        scroll_area.setWidget(scroll_widget)
+        layout.addWidget(scroll_area)
+
+        add_list_button = QPushButton("Add New List")
+        add_list_button.clicked.connect(self.create_new_list)
+        layout.addWidget(add_list_button)
+
+    def format_market_cap(self, market_cap_billions):
+        """
+        Format market cap (in billions) to abbreviated form (T, B, M).
+        Args:
+            market_cap_billions: Market capitalization in billions.
+        Returns:
+            Formatted string (e.g., '3.11T', '500B', '500M').
+        """
+        if market_cap_billions >= 1000:
+            return f"{market_cap_billions / 1000:.2f}T"  # Trillions
+        elif market_cap_billions >= 1:
+            return f"{market_cap_billions:.2f}B"  # Billions
+        else:
+            return f"{market_cap_billions * 1000:.0f}M"  # Millions
+
+    def create_table_for_list(self, screener_list):
+        list_container = QVBoxLayout()
+
+        header_layout = QHBoxLayout()
+        list_label = QLabel(screener_list.name)
+        list_label.setStyleSheet("font-size: 18px; color: #ECEFF4; font-weight: bold;")
+        header_layout.addWidget(list_label)
+
+        rename_button = QPushButton()
+        rename_button.setIcon(QIcon("./gui/icons/tools/edit.png"))
+        rename_button.clicked.connect(
+            lambda: self.rename_list(screener_list)
+        )
+        header_layout.addWidget(rename_button)
+
+        delete_button = QPushButton()
+        delete_button.setIcon(QIcon("./gui/icons/tools/delete.png"))
+        delete_button.clicked.connect(
+            lambda: self.delete_list(screener_list)
+        )
+        header_layout.addWidget(delete_button)
+
+        header_layout.addStretch()
+        list_container.addLayout(header_layout)
+
+        table = CustomTableWidget()
+        table.setColumnCount(6)  # Added one column for Volume
+        table.setHorizontalHeaderLabels([
             "Symbol", 
             "Price ($)", 
             "Change (%)", 
-            "Market Cap ($B)", 
-            "Volume (Shares)",
-            "Up Volume",  # New column
-            "Down Volume"     # New column
+            "Market Cap",  # Updated header
+            "Volume (Shares)", 
+            "Up/Down"
         ])
-        logger.debug(f"Header labels set: {self.results_table.horizontalHeaderItem(0).text()}, "
-                     f"{self.results_table.horizontalHeaderItem(1).text()}, "
-                     f"{self.results_table.horizontalHeaderItem(2).text()}, "
-                     f"{self.results_table.horizontalHeaderItem(3).text()}, "
-                     f"{self.results_table.horizontalHeaderItem(4).text()}, "
-                     f"{self.results_table.horizontalHeaderItem(5).text()}, "
-                     f"{self.results_table.horizontalHeaderItem(6).text()}")
-        self.results_table.horizontalHeader().setVisible(True)
-        logger.debug(f"Header visibility: {self.results_table.horizontalHeader().isVisible()}")
-        self.results_table.verticalHeader().setVisible(False)
-        self.results_table.horizontalHeaderItem(0).setToolTip("Stock ticker symbol (e.g., AAPL)")
-        self.results_table.horizontalHeaderItem(1).setToolTip("Current stock price in USD")
-        self.results_table.horizontalHeaderItem(2).setToolTip("Daily price change percentage")
-        self.results_table.horizontalHeaderItem(3).setToolTip("Market capitalization in billions of USD")
-        self.results_table.horizontalHeaderItem(4).setToolTip("Total trading volume in number of shares")
-        self.results_table.horizontalHeaderItem(5).setToolTip("Volume of shares bought")
-        self.results_table.horizontalHeaderItem(6).setToolTip("Volume of shares sold")
-        for i in range(self.results_table.columnCount()):
-            self.results_table.horizontalHeaderItem(i).setTextAlignment(Qt.AlignCenter)
-        self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.results_table.horizontalHeader().resizeSections(QHeaderView.Stretch)
-        self.results_table.setAlternatingRowColors(True)
-        self.results_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.results_table.setStyleSheet("""
+        table.horizontalHeader().setVisible(True)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeaderItem(0).setToolTip("Stock ticker symbol (e.g., AAPL)")
+        table.horizontalHeaderItem(1).setToolTip("Current stock price in USD")
+        table.horizontalHeaderItem(2).setToolTip("Daily price change percentage")
+        table.horizontalHeaderItem(3).setToolTip("Market capitalization (T: trillions, B: billions, M: millions)")
+        table.horizontalHeaderItem(4).setToolTip("Total trading volume (number of shares)")
+        table.horizontalHeaderItem(5).setToolTip("Up (green, right) and Down (red, left) volume meter")
+        for i in range(table.columnCount()):
+            table.horizontalHeaderItem(i).setTextAlignment(Qt.AlignCenter)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        table.setAlternatingRowColors(True)
+        table.setEditTriggers(CustomTableWidget.NoEditTriggers)
+        table.setStyleSheet("""
             QTableWidget {
                 background-color: #2E3440;
                 alternate-background-color: #3B4252;
@@ -383,282 +349,354 @@ class StockScreener(QWidget):
             QTableWidget::item:hover {
                 background-color: #4C566A;
             }
+            QHeaderView::section {
+                background-color: #4C566A;
+                color: #ECEFF4;
+                padding: 4px;
+                border: 1px solid #3B4252;
+            }
         """)
-        self.results_table.setSortingEnabled(False)
-        self.results_table.horizontalHeader().sectionClicked.connect(self.sort_table)
-        self.results_table.viewport().update()
-        table_container.addWidget(self.results_table)
-        
-        # Right click menu
-        self.results_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.results_table.setSelectionMode(QTableWidget.SingleSelection)
+        table.setSortingEnabled(False)
 
-        # Add Stock Button (below the table, aligned to the right)
+        header_height = table.horizontalHeader().height()
+        table.setRowCount(1)
+        row_height = table.rowHeight(0)
+        table.setRowCount(0)
+        min_height = header_height + (5 * row_height)
+        table.setMinimumHeight(min_height)
+
+        up_down_delegate = UpDownDelegate(table)
+        table.setItemDelegateForColumn(5, up_down_delegate)  # Updated column index
+
+        table.horizontalHeader().sectionClicked.connect(
+            lambda logical_index, sl=screener_list: self.sort_table(sl, logical_index)
+        )
+        list_container.addWidget(table)
+
+        table_edit = TableEdit(table, self, screener_list)
+        table_edit.trigger_start_update.connect(
+            lambda: self.handle_start_update(screener_list)
+        )
+        table_edit.table_updated.connect(
+            lambda: self.schedule_table_update(screener_list)
+        )
+
         button_container = QHBoxLayout()
         button_container.addStretch()
-        self.add_stock_button = QPushButton("+")
-        self.add_stock_button.setObjectName("AddStockButton")
-        self.add_stock_button.setToolTip("Add a new stock to the screener")
-        self.add_stock_button.clicked.connect(self.add_stock)
-        button_container.addWidget(self.add_stock_button)
-        table_container.addLayout(button_container)
-
-        layout.addLayout(table_container)
-
-        # Loading Indicator
-        self.loading_bar = QProgressBar()
-        self.loading_bar.setRange(0, 0)
-        self.loading_bar.setVisible(False)
-        self.loading_bar.setMaximumHeight(5)
-        layout.addWidget(self.loading_bar)
-        
-    def _save_symbols(self):
-        """Save the current symbols list to stocks.json."""
-        try:
-            with open(self.stocks_file, 'w') as f:
-                json.dump({"symbols": self.symbols}, f, indent=4)
-            logger.debug(f"Saved symbols to {self.stocks_file}: {self.symbols}")
-        except Exception as e:
-            logger.error(f"Error saving to {self.stocks_file}: {str(e)}")
-
-    def add_stock(self):
-        """Prompt the user to add a new stock symbol to the screener."""
-        symbol, ok = QInputDialog.getText(
-            self,
-            "Add Stock",
-            "Enter stock symbol (e.g., AAPL):",
-            QLineEdit.Normal
+        add_stock_button = QPushButton("+")
+        add_stock_button.setObjectName(f"AddStockButton_{screener_list.name}")
+        add_stock_button.setToolTip("Add a new stock to this list")
+        add_stock_button.clicked.connect(
+            lambda: self.add_stock(screener_list)
         )
-        if ok and symbol:
-            symbol = symbol.strip().upper()
-            if not symbol.isalnum():
-                logger.error(f"Invalid stock symbol: {symbol}. Must be alphanumeric.")
-                QMessageBox.warning(self, "Error", "Invalid stock symbol. It must be alphanumeric (e.g., AAPL).")
-                return
-            if symbol in self.symbols:
-                logger.debug(f"Stock symbol {symbol} already in screener.")
-                QMessageBox.information(self, "Info", f"Stock symbol {symbol} is already in the screener.")
-                return
+        button_container.addWidget(add_stock_button)
+        list_container.addLayout(button_container)
 
-            # Check if another stock addition is in progress
-            with self.lock:
-                if self.is_adding_stock:
-                    QMessageBox.warning(self, "Warning", "Another stock is being added. Please wait a moment and try again.")
-                    return
-                self.is_adding_stock = True
+        loading_bar = QProgressBar()
+        loading_bar.setRange(0, 0)
+        loading_bar.setVisible(False)
+        loading_bar.setMaximumHeight(5)
+        list_container.addWidget(loading_bar)
 
-            try:
-                # Add the symbol with placeholder data and update the UI immediately
-                with self.lock:
-                    self.symbols.append(symbol)
-                    self._save_symbols()  # Save the updated symbols list
-                    placeholder_stock = (symbol, "N/A", 0, 0, 0, 0, 0)  # Added volume_bought and volume_sold
-                    self.filtered_stocks.append(placeholder_stock)
-                    self.update_table()
-                    logger.debug(f"Temporarily added stock symbol with placeholder: {symbol}. New symbols list: {self.symbols}")
+        screener_list.table = table
+        screener_list.table_edit = table_edit
+        screener_list.loading_bar = loading_bar
+        screener_list.container_layout = list_container
 
-                # Fetch the actual data for the new stock asynchronously
-                self.loading_bar.setVisible(True)
-                self.add_stock_button.setEnabled(False)
-                self.stock_adder.add_stock(symbol, self.symbols)
+        self.tables_container.addLayout(list_container)
 
-                # Speed up the timer to update in 1 second
-                remaining_time = self.update_timer.remainingTime()
-                if remaining_time > 1000:  # If more than 1 second remains
-                    self.update_timer.stop()
-                    self.update_timer.start(1000)  # Schedule the next update in 1 second
-            except Exception as e:
-                logger.error(f"Error adding stock {symbol}: {str(e)}")
-                with self.lock:
-                    self.is_adding_stock = False
-                raise
+        update_timer = QTimer(self)
+        update_timer.setSingleShot(True)
+        update_timer.timeout.connect(
+            lambda sl=screener_list: self.deferred_update_table(sl)
+        )
+        self.update_timers[screener_list] = update_timer
+        self.pending_updates[screener_list] = False
 
-    @Slot(tuple)
-    def handle_add_stock(self, new_stock):
-        """Handle the signal from StockAdder when stock addition is successful."""
-        with self.lock:
-            # Replace the placeholder entry with the actual data
-            for i, stock in enumerate(self.filtered_stocks):
-                if stock[0] == new_stock[0]:  # Match by symbol
-                    self.filtered_stocks[i] = new_stock
-                    break
-            # Update the table only if StockUpdater isn't about to run
-            if not self.update_timer.isActive():
-                self.update_table()
-            logger.debug(f"Successfully updated stock {new_stock[0]}. New filtered stocks: {self.filtered_stocks}")
-            self.loading_bar.setVisible(False)
-            self.add_stock_button.setEnabled(True)
-            self.is_adding_stock = False  # Release the lock
-        
-    @Slot(str)
-    def handle_add_stock_error(self, error_message):
-        """Handle the error signal from StockAdder when stock addition fails."""
-        with self.lock:
-            # Remove the last added symbol and its placeholder since it failed
-            if self.symbols:
-                failed_symbol = self.symbols[-1]
-                self.symbols.pop()
-                self._save_symbols()  # Save the updated symbols list
-                self.filtered_stocks = [stock for stock in self.filtered_stocks if stock[0] != failed_symbol]
-                self.update_table()
-                logger.debug(f"Removed failed stock symbol: {failed_symbol}. New symbols list: {self.symbols}")
-            self.is_adding_stock = False  # Release the lock
-        QMessageBox.critical(self, "Error", f"Failed to add stock: {error_message}")
-        self.loading_bar.setVisible(False)
-        self.add_stock_button.setEnabled(True)
-        # Speed up the timer to update in 1 second
-        remaining_time = self.update_timer.remainingTime()
-        if remaining_time > 1000:  # If more than 1 second remains
-            self.update_timer.stop()
-            self.update_timer.start(1000)  # Schedule the next update in 1 second
+        updater = StockUpdater(self, screener_list)
+        updater.update_data.connect(self.on_update_data)
+        updater.set_loading_signal.connect(self.set_loading)
+        updater.start()
+        screener_list.updater = updater
 
-    def screen_stocks(self):
-        """Fetch and display filtered stock data from the Flask backend."""
+    def _load_screener_lists(self):
         try:
-            self.loading_bar.setVisible(True)
-            self.add_stock_button.setEnabled(False)
-            self.results_table.setRowCount(0)
-
-            request_data = {
-                "symbols": self.symbols
-            }
-            logger.debug(f"Sending request to backend: {request_data}")
-            response = requests.post(
-                f"{self.server_address}/api/screen",
-                json=request_data
-            )
-            response.raise_for_status()
-            stocks = response.json()
-            logger.debug(f"Received response from backend: {stocks}")
-
-            invalid_symbols = []
-            filtered_stocks = []
-            for stock in stocks:
-                symbol = stock[0]
-                change_percentage = stock[4]
-                if change_percentage is None:
-                    logger.warning(f"Stock {symbol}: change percentage is None")
-                    invalid_symbols.append(symbol)
-                    continue
-                # Ensure the stock tuple includes volume_bought and volume_sold
-                if len(stock) < 7:  # Expecting 7 fields
-                    stock = tuple(stock) + (0, 0)  # Add default values if not provided
-                filtered_stocks.append(stock)
-            self.filtered_stocks = filtered_stocks
-
-            if invalid_symbols:
-                raise ValueError(f"Ticker(s) not found: {', '.join(invalid_symbols)}")
-
-            self.update_table()
-
-        except ValueError as ve:
-            logger.error(f"Input validation error: {str(ve)}")
-            QMessageBox.critical(self, "Error", str(ve))
+            if os.path.exists("json/screener_lists.json"):
+                with open("json/screener_lists.json", "r") as f:
+                    data = json.load(f)
+                    self.screener_lists = []
+                    for list_data in data:
+                        # Load both symbols and display_order from JSON
+                        symbols = list_data.get("symbols", [])
+                        display_order = list_data.get("display_order", symbols)  # Fallback to symbols if not present
+                        # Ensure display_order contains only valid symbols
+                        display_order = [symbol for symbol in display_order if symbol in symbols]
+                        # Add any missing symbols to the end of display_order
+                        for symbol in symbols:
+                            if symbol not in display_order:
+                                display_order.append(symbol)
+                        screener_list = ScreenerList(
+                            name=list_data["name"],
+                            symbols=symbols,
+                            display_order=display_order
+                        )
+                        self.screener_lists.append(screener_list)
+            if not self.screener_lists:
+                self.screener_lists.append(ScreenerList("Default List", ["AAPL", "MSFT", "GOOGL"]))
+            for screener_list in self.screener_lists:
+                self.create_table_for_list(screener_list)
+                self.handle_start_update(screener_list)
         except Exception as e:
-            logger.error(f"Error screening stocks: {str(e)}")
-            QMessageBox.critical(self, "Error", f"Error screening stocks: {str(e)}")
-        finally:
-            self.loading_bar.setVisible(False)
-            self.add_stock_button.setEnabled(True)
+            logger.error(f"Error loading screener lists: {e}")
+            self.screener_lists = [ScreenerList("Default List", ["AAPL", "MSFT", "GOOGL"])]
+            for screener_list in self.screener_lists:
+                self.create_table_for_list(screener_list)
+
+    def _save_screener_lists(self):
+        try:
+            data = [
+                {
+                    "name": screener_list.name,
+                    "symbols": screener_list.symbols,
+                    "display_order": screener_list.display_order  # Save the display order
+                }
+                for screener_list in self.screener_lists
+            ]
+            with open("json/screener_lists.json", "w") as f:
+                json.dump(data, f, indent=4)
+        except Exception as e:
+            logger.error(f"Error saving screener lists: {e}")
+
+    def create_new_list(self):
+        name, ok = QInputDialog.getText(self, "New Screener List", "Enter list name:")
+        if ok and name:
+            if any(screener_list.name == name for screener_list in self.screener_lists):
+                QMessageBox.warning(self, "Error", "A list with this name already exists.")
+                return
+            screener_list = ScreenerList(name)
+            self.screener_lists.append(screener_list)
+            self.create_table_for_list(screener_list)
+            self._save_screener_lists()
+            self.handle_start_update(screener_list)
+
+    def rename_list(self, screener_list):
+        name, ok = QInputDialog.getText(self, "Rename Screener List", "Enter new name:", text=screener_list.name)
+        if ok and name:
+            if any(sl.name == name for sl in self.screener_lists if sl != screener_list):
+                QMessageBox.warning(self, "Error", "A list with this name already exists.")
+                return
+            screener_list.name = name
+            header_layout = screener_list.container_layout.itemAt(0).layout()
+            label = header_layout.itemAt(0).widget()
+            label.setText(name)
+            button_container = screener_list.container_layout.itemAt(2).layout()
+            add_stock_button = button_container.itemAt(1).widget()
+            add_stock_button.setObjectName(f"AddStockButton_{name}")
+            self._save_screener_lists()
+
+    def delete_list(self, screener_list):
+        if len(self.screener_lists) <= 1:
+            QMessageBox.warning(self, "Error", "Cannot delete the last screener list.")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Delete Screener List",
+            f"Are you sure you want to delete '{screener_list.name}'?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            screener_list.updater.running = False
+            screener_list.updater.wait()
+
+            container_layout = screener_list.container_layout
+            while container_layout.count():
+                item = container_layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+                elif item.layout():
+                    sub_layout = item.layout()
+                    while sub_layout.count():
+                        sub_item = sub_layout.takeAt(0)
+                        if sub_item.widget():
+                            sub_item.widget().deleteLater()
+                    sub_layout.deleteLater()
+            container_layout.deleteLater()
+
+            self.screener_lists.remove(screener_list)
+            if screener_list in self.update_timers:
+                self.update_timers[screener_list].stop()
+                del self.update_timers[screener_list]
+            if screener_list in self.pending_updates:
+                del self.pending_updates[screener_list]
+
+            self._save_screener_lists()
+
+    def add_stock(self, screener_list):
+        symbol, ok = QInputDialog.getText(self, "Add Stock", "Enter stock symbol (e.g., AAPL):")
+        if ok and symbol:
+            symbol = symbol.upper().strip()
+            if symbol in screener_list.symbols:
+                QMessageBox.warning(self, "Error", f"Stock {symbol} is already in the list.")
+                return
+            adder = StockAdder(self, screener_list, symbol)
+            adder.add_stock_finished.connect(self.on_add_stock_finished)
+            adder.set_loading_signal.connect(self.set_loading)
+            adder.start()
+
+    @Slot(ScreenerList, tuple)
+    def on_add_stock_finished(self, screener_list, stock_tuple):
+        with self.lock:
+            if stock_tuple[0] not in screener_list.symbols:
+                screener_list.symbols.append(stock_tuple[0])
+                # Add the new symbol to the display_order (at the end)
+                screener_list.display_order.append(stock_tuple[0])
+                screener_list.filtered_stocks.append(stock_tuple)
+                self._save_screener_lists()
+        self.schedule_table_update(screener_list)
+
+    @Slot(ScreenerList, bool)
+    def set_loading(self, screener_list, loading):
+        screener_list.loading_bar.setVisible(loading)
+
+    @Slot(ScreenerList, list)
+    def on_update_data(self, screener_list, filtered_stocks):
+        with self.lock:
+            screener_list.filtered_stocks = filtered_stocks
+        self.schedule_table_update(screener_list)
+
+    def handle_start_update(self, screener_list):
+        if not screener_list.symbols:
+            return
+        worker = StartUpdateWorker(self, screener_list, screener_list.symbols)
+        worker.update_finished.connect(self.on_start_update_finished)
+        worker.set_loading_signal.connect(self.set_loading)
+        worker.start()
+
+    @Slot(ScreenerList, list)
+    def on_start_update_finished(self, screener_list, filtered_stocks):
+        with self.lock:
+            screener_list.filtered_stocks = filtered_stocks
+            # Update display_order based on the initial filtered_stocks order if not set
+            if not screener_list.display_order:
+                screener_list.display_order = [stock[0] for stock in filtered_stocks]
+        self.schedule_table_update(screener_list)
+
+    def schedule_table_update(self, screener_list):
+        if screener_list not in self.pending_updates:
+            logger.warning(f"ScreenerList {screener_list.name} not found in pending_updates. Skipping update.")
+            return
+        if not self.pending_updates[screener_list]:
+            self.pending_updates[screener_list] = True
+            self.update_timers[screener_list].start(50)
 
     @Slot()
-    def update_table(self):
-        """Update the table with the current filtered stocks, applying sorting if needed."""
-        if self.sort_column >= 0:
-            self.filtered_stocks.sort(
-                key=lambda x: (
-                    x[self.sort_column] if self.sort_column != 2 else x[4]
-                ),
-                reverse=(self.sort_order == Qt.DescendingOrder)
-            )
+    def deferred_update_table(self, screener_list):
+        if screener_list not in self.pending_updates:
+            logger.warning(f"ScreenerList {screener_list.name} not found in pending_updates during deferred update. Skipping.")
+            return
+        self.pending_updates[screener_list] = False
+        self.update_table(screener_list)
 
-        self.results_table.setRowCount(len(self.filtered_stocks))
-        for row, stock in enumerate(self.filtered_stocks):
-            symbol, price, market_cap, volume, change_percentage, volume_bought, volume_sold = stock
-            if row == 0:
-                logger.debug(f"Processing stock: {symbol}, Price: {price}, Market Cap: {market_cap}, "
-                             f"Volume: {volume}, Change: {change_percentage}, "
-                             f"Buy Volume: {volume_bought}, Sell Volume: {volume_sold}")  # Updated terminology
-            
-            self.results_table.setItem(row, 0, QTableWidgetItem(str(symbol)))
-            # Handle price: display as-is if it's a string, otherwise format as float
-            price_display = price if isinstance(price, str) else f"{price:.2f}"
-            price_item = QTableWidgetItem(price_display)
-            # Color-code price based on change_percentage
-            if not isinstance(change_percentage, str) and change_percentage is not None:
-                price_item.setForeground(QColor("green" if change_percentage >= 0 else "red"))
-            self.results_table.setItem(row, 1, price_item)
-            # Handle change percentage: display as-is if it's a string, otherwise format as float and color-code
-            change_display = change_percentage if isinstance(change_percentage, str) else f"{change_percentage:+.2f}"
-            change_item = QTableWidgetItem(change_display)
-            if not isinstance(change_percentage, str) and change_percentage is not None:
-                change_item.setForeground(QColor("green" if change_percentage >= 0 else "red"))
-            self.results_table.setItem(row, 2, change_item)
-            # Handle market cap: display as-is if it's a string, otherwise format
-            market_cap_display = market_cap if isinstance(market_cap, str) else f"{market_cap/1e3:.1f}"
-            self.results_table.setItem(row, 3, QTableWidgetItem(market_cap_display))
-            # Handle volume: display as-is if it's a string, otherwise format with commas
-            volume_display = volume if isinstance(volume, str) else f"{int(volume):,}"
-            self.results_table.setItem(row, 4, QTableWidgetItem(volume_display))
-            # Handle buy volume: display as-is if it's a string, otherwise format with commas
-            volume_bought_display = volume_bought if isinstance(volume_bought, str) else f"{int(volume_bought):,}"
-            self.results_table.setItem(row, 5, QTableWidgetItem(volume_bought_display))
-            # Handle sell volume: display as-is if it's a string, otherwise format with commas
-            volume_sold_display = volume_sold if isinstance(volume_sold, str) else f"{int(volume_sold):,}"
-            self.results_table.setItem(row, 6, QTableWidgetItem(volume_sold_display))
-
-        self.results_table.resizeColumnsToContents()
-        self.results_table.horizontalHeader().setVisible(True)
-        self.results_table.horizontalHeader().resizeSections(QHeaderView.Stretch)
-        self.results_table.viewport().update()
-        self.loading_bar.setVisible(False)
-
-    def sort_table(self, column):
-        """Sort the table by the clicked column."""
-        if self.sort_column == column:
-            self.sort_order = Qt.DescendingOrder if self.sort_order == Qt.AscendingOrder else Qt.AscendingOrder
-        else:
-            self.sort_column = column
-            self.sort_order = Qt.AscendingOrder
-        self.update_table()
-
-    def start_update(self, show_loading_bar=True):
-        """Trigger the update process in StockUpdater."""
-        if show_loading_bar:
-            self.loading_bar.setVisible(True)
+    def update_table(self, screener_list):
+        table = screener_list.table
         with self.lock:
-            self.stock_updater.start_update(self.filtered_stocks, self.symbols)
-            
-    @Slot()
-    def handle_update(self, hide_loading_bar=True):
-        """Handle the update signal from StockUpdater by updating filtered_stocks and the UI."""
+            # Create a mapping of symbol to stock data
+            stock_dict = {stock[0]: stock for stock in screener_list.filtered_stocks}
+            # Order stocks according to display_order, falling back to available data
+            stocks_to_display = []
+            # First, add stocks in the display_order that still exist in filtered_stocks
+            for symbol in screener_list.display_order:
+                if symbol in stock_dict:
+                    stocks_to_display.append(stock_dict[symbol])
+                    del stock_dict[symbol]  # Remove to avoid duplicates
+            # Then, append any remaining stocks that weren't in display_order
+            stocks_to_display.extend(stock_dict.values())
+
+            # Apply sorting if a sort column is active
+            if screener_list.sort_column >= 0:
+                if screener_list.sort_column == 5:  # Up/Down column
+                    stocks_to_display.sort(
+                        key=lambda x: x[5] - x[6],
+                        reverse=(screener_list.sort_order == Qt.DescendingOrder)
+                    )
+                else:
+                    stocks_to_display.sort(
+                        key=lambda x: (
+                            x[screener_list.sort_column] if screener_list.sort_column != 2 else x[2]
+                        ),
+                        reverse=(screener_list.sort_order == Qt.DescendingOrder)
+                    )
+                # Update display_order to reflect the new sorted order
+                screener_list.display_order = [stock[0] for stock in stocks_to_display]
+                self._save_screener_lists()
+
+        max_combined_volume = 1
+        for stock in stocks_to_display:
+            up_volume = stock[5]
+            down_volume = stock[6]
+            combined = up_volume + down_volume
+            max_combined_volume = max(max_combined_volume, combined)
+
+        delegate = table.itemDelegateForColumn(5)  # Updated column index
+        if delegate:
+            delegate.set_max_combined_volume(max_combined_volume)
+
+        current_row_count = table.rowCount()
+        new_row_count = len(stocks_to_display)
+
+        if current_row_count != new_row_count:
+            table.setRowCount(new_row_count)
+
+        for row, stock in enumerate(stocks_to_display):
+            for col in range(5):  # Updated to 5 to include Volume column
+                item = table.item(row, col)
+                value = stock[col]
+                if col == 3:  # Market Cap column
+                    new_text = self.format_market_cap(value)  # Format market cap
+                elif col == 4:  # Volume column
+                    new_text = f"{int(value):,}"  # Format volume with commas
+                else:
+                    new_text = f"{value:.2f}%" if col == 2 else str(value)
+                if not item or item.text() != new_text:
+                    item = QTableWidgetItem(new_text)
+                    if col == 2:
+                        if value > 0:
+                            item.setForeground(Qt.green)
+                        elif value < 0:
+                            item.setForeground(Qt.red)
+                    item.setTextAlignment(Qt.AlignCenter)
+                    table.setItem(row, col, item)
+
+            # Up/Down column (now column 5)
+            up_volume = stock[5]
+            down_volume = stock[6]
+            item = table.item(row, 5)  # Updated column index
+            if not item:
+                item = QTableWidgetItem()
+                table.setItem(row, 5, item)
+            item.setData(Qt.UserRole, up_volume)
+            item.setData(Qt.UserRole + 1, down_volume)
+            item.setText("")
+
+    def sort_table(self, screener_list, logical_index):
         with self.lock:
-            self.filtered_stocks = self.stock_updater.get_filtered_stocks()
-            self.update_table()
-        if hide_loading_bar:
-            self.loading_bar.setVisible(False)
-        # Revert the timer to its regular 15-second interval if it was sped up
-        if self.update_timer.interval() != 15000:
-            self.update_timer.stop()
-            self.update_timer.start(15000)  # Revert to 15-second interval
+            if screener_list.sort_column == logical_index:
+                screener_list.sort_order = (
+                    Qt.DescendingOrder
+                    if screener_list.sort_order == Qt.AscendingOrder
+                    else Qt.AscendingOrder
+                )
+            else:
+                screener_list.sort_column = logical_index
+                screener_list.sort_order = Qt.AscendingOrder
+        self.schedule_table_update(screener_list)
 
-    def is_valid_float(self, value):
-        """Validate if a string can be converted to a float."""
-        try:
-            float(value)
-            return True
-        except ValueError:
-            return False
-
-    def is_valid_int(self, value):
-        """Validate if a string can be converted to an integer."""
-        try:
-            int(value)
-            return True
-        except ValueError:
-            return False
-
-    def __del__(self):
-        """Stop the timer when the widget is destroyed."""
-        if hasattr(self, 'update_timer'):
-            self.update_timer.stop()
+    def closeEvent(self, event):
+        for screener_list in self.screener_lists:
+            if screener_list.updater:
+                screener_list.updater.running = False
+                screener_list.updater.wait()
+        self._save_screener_lists()  # Ensure the latest order is saved on close
+        event.accept()
